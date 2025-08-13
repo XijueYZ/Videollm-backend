@@ -264,14 +264,10 @@ def handle_send_image(data):
             emit('error', {'message': '图片数据不能为空'})
             return
         
-        # Log the length and a snippet of the base64 image data
-        logger.info(f"Base64数据长度: {len(image_data)}，前50字符: {image_data[:50]}")
-        
         # Convert base64 image data to PIL format
         try:
             base64_data = re.sub('^data:image/.+;base64,', '', image_data)
             image_bytes = base64.b64decode(base64_data)
-            logger.info(f"解码后字节数据长度: {len(image_bytes)}")
             image = Image.open(BytesIO(image_bytes))
         except Exception as e:
             logger.error(f"图片解码失败: {e}")

@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class ModelManager:
     """模型管理器，负责管理单个模型实例的完整生命周期"""
     
-    def __init__(self, model_instance: Any, manager_id: str):
+    def __init__(self, manager_id: str):
         checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/resources/video_hf/models/video_mllama_real_time"
 
         self.processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True, frame_extract_num_threads=1)
@@ -100,7 +100,7 @@ class ModelManager:
         try:
             # 调用模型的generate函数，只调用一次
             # 函数内部会自己循环处理队列
-            if hasattr(self.model_instance, 'generate'):
+            if hasattr(self.model_instance, 'real_time_generate'):
                 logger.info(f"管理器 {self.manager_id} 开始调用generate函数")
                 # TODO:
                 self.model_instance.real_time_generate(self.image_queue, self.prompt_queue, self.token_queue, self.processor, max_tokens_per_turn=86400, do_sample=False)
@@ -255,17 +255,7 @@ class ModelPool:
         for i in range(self.pool_size):
             manager_id = f"manager_{i+1}_{uuid.uuid4().hex[:8]}"
             
-            if self.model_class:
-                # 创建真实的模型实例
-                model_instance = self.model_class()
-            else:
-                # 创建模拟模型实例
-                model_instance = type('MockModel', (), {
-                    'generate': lambda prompt, images, output_queue: output_queue.put(f"Mock response for: {prompt}"),
-                    'stop': lambda: None
-                })()
-            
-            manager = ModelManager(model_instance, manager_id)
+            manager = ModelManager(manager_id)
             self._all_managers.append(manager)
             self._available_managers.put(manager)
     
