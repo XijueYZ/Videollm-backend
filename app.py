@@ -1,3 +1,4 @@
+import re
 from flask import Flask, request
 from flask_socketio import SocketIO, emit, disconnect
 from threading import Lock
@@ -7,6 +8,9 @@ import time
 import threading
 from model_pool import ModelPool
 from config import Config
+import base64
+from io import BytesIO
+from PIL import Image
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -19,7 +23,7 @@ app.config.from_object(Config)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # 初始化模型池
-model_pool = ModelPool(pool_size=8)
+model_pool = ModelPool(pool_size=1)
 
 # 存储客户端连接和模型管理器的映射关系
 client_managers = {}
@@ -260,12 +264,26 @@ def handle_send_image(data):
             emit('error', {'message': '图片数据不能为空'})
             return
         
+        # Log the length and a snippet of the base64 image data
+        logger.info(f"Base64数据长度: {len(image_data)}，前50字符: {image_data[:50]}")
+        
+        # Convert base64 image data to PIL format
+        try:
+            base64_data = re.sub('^data:image/.+;base64,', '', image_data)
+            image_bytes = base64.b64decode(base64_data)
+            logger.info(f"解码后字节数据长度: {len(image_bytes)}")
+            image = Image.open(BytesIO(image_bytes))
+        except Exception as e:
+            logger.error(f"图片解码失败: {e}")
+            emit('error', {'message': '图片解码失败'})
+            return
+        
         logger.info(f"客户端 {client_id} 发送图片分析请求")
         
         # 先添加prompt（如果有），再添加图片
         if prompt:
             manager.add_prompt(prompt)
-        manager.add_image(image_data)
+        manager.add_image(image)
         
     except Exception as e:
         logger.error(f"处理图片失败: {e}")

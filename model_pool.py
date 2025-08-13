@@ -6,6 +6,9 @@ from typing import Optional, List, Callable, Any
 from queue import Queue, Empty
 import uuid
 
+import torch
+from transformers import AutoProcessor, AutoModelForCausalLM
+
 logger = logging.getLogger(__name__)
 
 
@@ -13,7 +16,12 @@ class ModelManager:
     """模型管理器，负责管理单个模型实例的完整生命周期"""
     
     def __init__(self, model_instance: Any, manager_id: str):
-        self.model_instance = model_instance  # 外部提供的模型实例
+        checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/resources/video_hf/models/video_mllama_real_time"
+
+        self.processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True, frame_extract_num_threads=1)
+
+        self.model_instance = AutoModelForCausalLM.from_pretrained(checkpoint, trust_remote_code=True, device_map="auto", torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+
         self.manager_id = manager_id
         self.is_active = False
         self.created_at = time.time()
@@ -95,11 +103,7 @@ class ModelManager:
             if hasattr(self.model_instance, 'generate'):
                 logger.info(f"管理器 {self.manager_id} 开始调用generate函数")
                 # TODO:
-                # self.model_instance.generate(
-                #     prompt_queue=self.prompt_queue,
-                #     image_queue=self.image_queue,
-                #     output_queue=self.token_queue
-                # )
+                self.model_instance.real_time_generate(self.image_queue, self.prompt_queue, self.token_queue, self.processor, max_tokens_per_turn=86400, do_sample=False)
                 while True:
                     # 随机往output_queue中放入token
                     self.token_queue.put(f"token_{random.randint(1, 1000000)}")
@@ -152,14 +156,14 @@ class ModelManager:
         self.prompt_queue.put(prompt)
         logger.info(f"管理器 {self.manager_id} 接收prompt: {prompt[:50]}...")
     
-    def add_image(self, image_data: Any):
+    def add_image(self, image: Any):
         """添加图片到队列"""
         if not self.is_active:
             error_msg = f"管理器 {self.manager_id} 未启动"
             logger.error(error_msg)
             raise RuntimeError(error_msg)
         
-        self.image_queue.put(image_data)
+        self.image_queue.put(image)
         logger.info(f"管理器 {self.manager_id} 接收图片数据")
     
     def stop_session(self):
@@ -175,12 +179,11 @@ class ModelManager:
             self._stop_event.set()
             
             # 调用模型的stop函数
-            if hasattr(self.model_instance, 'stop'):
-                try:
-                    self.model_instance.stop()
-                    logger.info(f"调用模型 {self.manager_id} stop函数成功")
-                except Exception as e:
-                    logger.error(f"调用模型 {self.manager_id} stop函数失败: {e}")
+            try:
+                self.model_instance.stop_real_time_generate()
+                logger.info(f"调用模型 {self.manager_id} stop函数成功")
+            except Exception as e:
+                logger.error(f"调用模型 {self.manager_id} stop函数失败: {e}")
             
             # 等待线程结束
             if self._generate_thread and self._generate_thread.is_alive():
@@ -234,7 +237,7 @@ class ModelManager:
 class ModelPool:
     """模型池，只负责模型的分发和回收"""
     
-    def __init__(self, pool_size: int = 8, model_class=None):
+    def __init__(self, pool_size: int = 1, model_class=None):
         self.pool_size = pool_size
         self.model_class = model_class
         self._available_managers = Queue(maxsize=pool_size)
