@@ -27,14 +27,26 @@ model_pool = ModelPool(pool_size=1)
 
 # 存储客户端连接和模型管理器的映射关系
 client_managers = {}
-# 存储等待模型的客户端队列
+# 存储等待模型的客户端队列  
 waiting_clients = {}
+# 新增：跟踪活跃的客户端连接状态
+active_clients = set()
 client_lock = Lock()
 
 
 @app.route('/')
 def index():
-    return {'status': 'VideoLLM Backend Running', 'available_models': model_pool.available_count()}
+    with client_lock:
+        waiting_count = len(waiting_clients)
+        active_count = len(client_managers)
+    
+    return {
+        'available_models': model_pool.available_count(),
+        'total_models': model_pool.pool_size,
+        'active_connections': active_count,
+        'waiting_connections': waiting_count,
+        'status': model_pool.get_pool_status()
+    }
 
 
 @app.route('/status')
@@ -47,9 +59,30 @@ def status():
         'available_models': model_pool.available_count(),
         'total_models': model_pool.pool_size,
         'active_connections': active_count,
-        'waiting_connections': waiting_count
+        'waiting_connections': waiting_count,
+        'status': model_pool.get_pool_status()
     }
 
+
+# 在所有发送消息的地方，统一使用这个安全的发送函数
+def safe_emit(event, data):
+    """安全地发送消息，处理连接断开的情况"""
+    client_id = request.sid
+    try:
+        # 检查客户端是否仍然活跃
+        with client_lock:
+            if client_id not in active_clients:
+                logger.debug(f"客户端 {client_id} 已断开，跳过消息发送")
+                return False
+        
+        socketio.emit(event, data)
+        return True
+    except Exception as e:
+        logger.error(f"发送消息失败: {e}")
+        # 从活跃连接中移除
+        with client_lock:
+            active_clients.discard(client_id)
+        return False
 
 def try_assign_model_to_waiting_clients():
     """尝试为等待中的客户端分配模型"""
@@ -76,10 +109,12 @@ def try_assign_model_to_waiting_clients():
             def token_callback(token):
                 """当模型生成新token时的回调"""
                 try:
-                    socketio.emit('new_token', {'token': token}, room=client_id)
+                    safe_emit('new_token', {'token': token})
                     logger.debug(f"发送token给客户端 {client_id}: {token}")
                 except Exception as e:
                     logger.error(f"发送token失败: {e}")
+                    with client_lock:
+                        active_clients.discard(client_id)
             
             # 启动模型会话
             manager.start_session(token_callback)
@@ -91,20 +126,32 @@ def try_assign_model_to_waiting_clients():
             logger.info(f"客户端 {client_id} 等待 {wait_time:.2f}秒后成功分配到管理器 {manager.manager_id}")
             
             # 通知客户端分配成功
-            socketio.emit('connected', {
-                'message': '连接成功',
-                'model_id': manager.manager_id,
-                'available_models': model_pool.available_count(),
-                'wait_time': wait_time
-            }, room=client_id)
+            try:
+                safe_emit('connected', {
+                    'message': '连接成功',
+                    'model_id': manager.manager_id,
+                    'available_models': model_pool.available_count(),
+                    'wait_time': wait_time
+                }, room=client_id)
+            except (ConnectionError, Exception) as e:
+                logger.error(f"向客户端 {client_id} 发送连接成功消息失败: {e}")
+                # 如果连接已断开，清理资源
+                with client_lock:
+                    active_clients.discard(client_id)
+                    if client_id in client_managers:
+                        del client_managers[client_id]
+                model_pool.release_model(manager)
+                return
             
         except Exception as e:
-            logger.error(f"为等待客户端分配模型失败: {e}")
-            # 模型分配失败，放回池中
-            model_pool.release_model(manager)
-            # 重新加入等待队列
-            waiting_clients[client_id] = client_info
-            socketio.emit('error', {'message': f'模型分配失败: {str(e)}'}, room=client_id)
+            logger.error(f"为客户端 {client_id} 分配模型失败: {e}")
+            
+            try:
+                safe_emit('error', {'message': f'模型分配失败: {str(e)}'})
+            except (ConnectionError, Exception) as emit_error:
+                logger.error(f"向客户端 {client_id} 发送错误消息失败: {emit_error}")
+                with client_lock:
+                    active_clients.discard(client_id)
 
 
 @socketio.on('connect')
@@ -112,6 +159,10 @@ def handle_connect():
     """处理客户端连接"""
     client_id = request.sid
     logger.info(f"客户端 {client_id} 尝试连接")
+    
+    # 将客户端添加到活跃连接集合
+    with client_lock:
+        active_clients.add(client_id)
     
     try:
         # 尝试获取模型管理器
@@ -129,12 +180,20 @@ def handle_connect():
             logger.info(f"客户端 {client_id} 加入等待队列，当前等待人数: {len(waiting_clients)}")
             
             # 通知客户端正在等待
-            socketio.emit('waiting_for_model', {
-                'message': '模型池繁忙，正在等待空闲模型...',
-                'queue_position': len(waiting_clients),
-                'available_models': model_pool.available_count(),
-                'total_models': model_pool.pool_size
-            })
+            try:
+                safe_emit('waiting_for_model', {
+                    'message': '模型池繁忙，正在等待空闲模型...',
+                    'queue_position': len(waiting_clients),
+                    'available_models': model_pool.available_count(),
+                    'total_models': model_pool.pool_size
+                })
+            except (ConnectionError, Exception) as e:
+                logger.error(f"向等待客户端 {client_id} 发送等待消息失败: {e}")
+                with client_lock:
+                    active_clients.discard(client_id)
+                    if client_id in waiting_clients:
+                        del waiting_clients[client_id]
+                return
             
             # 启动定期检查，为等待的客户端分配模型
             def check_and_assign():
@@ -149,11 +208,25 @@ def handle_connect():
         def token_callback(token):
             """当模型生成新token时的回调"""
             try:
+                # 检查客户端是否仍然连接
+                with client_lock:
+                    if client_id not in active_clients:
+                        logger.debug(f"客户端 {client_id} 已断开，跳过token发送: {token}")
+                        return
+                
                 # 使用 socketio.emit() 而不是 emit()，并指定 room
-                socketio.emit('new_token', {'token': token}, room=client_id)
+                safe_emit('new_token', {'token': token})
                 logger.debug(f"发送token给客户端 {client_id}: {token}")
+            except ConnectionError:
+                logger.warning(f"客户端 {client_id} 连接已断开，停止发送token")
+                with client_lock:
+                    active_clients.discard(client_id)
             except Exception as e:
                 logger.error(f"发送token失败: {e}")
+                # 如果是连接相关错误，从活跃连接中移除
+                if "connection" in str(e).lower() or "broken pipe" in str(e).lower():
+                    with client_lock:
+                        active_clients.discard(client_id)
         
         # 启动模型会话
         manager.start_session(token_callback)
@@ -165,16 +238,32 @@ def handle_connect():
         logger.info(f"客户端 {client_id} 连接成功，直接分配管理器 {manager.manager_id}")
         
         # 修复：使用 socketio.emit 而不是 emit
-        socketio.emit('connected', {
-            'message': '连接成功',
-            'model_id': manager.manager_id,
-            'available_models': model_pool.available_count(),
-            'wait_time': 0
-        })
+        try:
+            safe_emit('connected', {
+                'message': '连接成功',
+                'model_id': manager.manager_id,
+                'available_models': model_pool.available_count(),
+                'wait_time': 0
+            })
+        except (ConnectionError, Exception) as e:
+            logger.error(f"向客户端 {client_id} 发送连接成功消息失败: {e}")
+            # 如果连接已断开，清理资源
+            with client_lock:
+                active_clients.discard(client_id)
+                if client_id in client_managers:
+                    del client_managers[client_id]
+            model_pool.release_model(manager)
+            return
         
     except Exception as e:
         logger.error(f"处理客户端连接失败: {e}")
-        emit('error', {'message': f'连接失败: {str(e)}'})
+        # 如果连接失败，从活跃连接中移除
+        with client_lock:
+            active_clients.discard(client_id)
+        try:
+            safe_emit('error', {'message': f'连接失败: {str(e)}'})
+        except:
+            logger.error(f"发送错误消息失败，客户端 {client_id} 可能已断开")
 
 
 @socketio.on('disconnect')
@@ -184,6 +273,9 @@ def handle_disconnect():
     logger.info(f"客户端 {client_id} 断开连接")
     
     with client_lock:
+        # 立即从活跃连接集合中移除，防止后续token回调
+        active_clients.discard(client_id)
+        
         # 检查是否在等待队列中
         if client_id in waiting_clients:
             wait_time = time.time() - waiting_clients[client_id]['wait_start']
@@ -214,11 +306,11 @@ def handle_send_message(data):
     with client_lock:
         # 检查客户端是否在等待队列中
         if client_id in waiting_clients:
-            emit('error', {'message': '正在等待模型分配，请稍后再试'})
+            safe_emit('error', {'message': '正在等待模型分配，请稍后再试'})
             return
         
         if client_id not in client_managers:
-            emit('error', {'message': '未找到分配的模型管理器'})
+            safe_emit('error', {'message': '未找到分配的模型管理器'})
             return
         
         manager = client_managers[client_id]
@@ -226,7 +318,7 @@ def handle_send_message(data):
     try:
         message = data.get('message', '')
         if not message:
-            emit('error', {'message': '消息内容不能为空'})
+            safe_emit('error', {'message': '消息内容不能为空'})
             return
         
         logger.info(f"客户端 {client_id} 发送消息: {message[:50]}...")
@@ -236,7 +328,7 @@ def handle_send_message(data):
         
     except Exception as e:
         logger.error(f"处理消息失败: {e}")
-        emit('error', {'message': f'消息处理失败: {str(e)}'})
+        safe_emit('error', {'message': f'消息处理失败: {str(e)}'})
 
 
 @socketio.on('send_image')
@@ -247,11 +339,11 @@ def handle_send_image(data):
     with client_lock:
         # 检查客户端是否在等待队列中
         if client_id in waiting_clients:
-            emit('error', {'message': '正在等待模型分配，请稍后再试'})
+            safe_emit('error', {'message': '正在等待模型分配，请稍后再试'})
             return
         
         if client_id not in client_managers:
-            emit('error', {'message': '未找到分配的模型管理器'})
+            safe_emit('error', {'message': '未找到分配的模型管理器'})
             return
         
         manager = client_managers[client_id]
@@ -261,17 +353,23 @@ def handle_send_image(data):
         prompt = data.get('prompt', '')
         
         if not image_data:
-            emit('error', {'message': '图片数据不能为空'})
+            safe_emit('error', {'message': '图片数据不能为空'})
             return
+        
         
         # Convert base64 image data to PIL format
         try:
+            # Remove data URL prefix if present
             base64_data = re.sub('^data:image/.+;base64,', '', image_data)
             image_bytes = base64.b64decode(base64_data)
             image = Image.open(BytesIO(image_bytes))
+            
         except Exception as e:
             logger.error(f"图片解码失败: {e}")
-            emit('error', {'message': '图片解码失败'})
+            try:
+                safe_emit('error', {'message': '图片解码失败'})
+            except Exception as emit_error:
+                logger.error(f"发送错误消息失败: {emit_error}")
             return
         
         logger.info(f"客户端 {client_id} 发送图片分析请求")
@@ -283,9 +381,9 @@ def handle_send_image(data):
         
     except Exception as e:
         logger.error(f"处理图片失败: {e}")
-        emit('error', {'message': f'图片处理失败: {str(e)}'})
+        safe_emit('error', {'message': f'图片处理失败: {str(e)}'})
 
 
 if __name__ == '__main__':
     logger.info("启动VideoLLM后端服务...")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    socketio.run(app, host='0.0.0.0', port=5001, debug=False)

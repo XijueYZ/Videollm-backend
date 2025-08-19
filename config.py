@@ -4,17 +4,7 @@ import os
 class Config:
     """应用配置类"""
     
-    # Flask配置
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 'videollm-secret-key-2024'
     DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
-    
-    # SocketIO配置
-    SOCKETIO_ASYNC_MODE = 'threading'
-    SOCKETIO_CORS_ALLOWED_ORIGINS = "*"
-    
-    # 模型池配置
-    MODEL_POOL_SIZE = int(os.environ.get('MODEL_POOL_SIZE', 8))
-    MODEL_ACQUIRE_TIMEOUT = float(os.environ.get('MODEL_ACQUIRE_TIMEOUT', 0.1))
     
     # 服务器配置
     HOST = os.environ.get('HOST', '0.0.0.0')

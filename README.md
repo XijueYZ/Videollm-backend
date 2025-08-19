@@ -118,12 +118,9 @@ gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:5000 app:app
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `SECRET_KEY` | `videollm-secret-key-2024` | Flask密钥 |
 | `DEBUG` | `false` | 调试模式 |
 | `HOST` | `0.0.0.0` | 服务监听地址 |
 | `PORT` | `5000` | 服务端口 |
-| `MODEL_POOL_SIZE` | `8` | 模型池大小 |
-| `MODEL_ACQUIRE_TIMEOUT` | `0.1` | 模型获取超时时间（秒） |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 
 ### 生产环境部署
@@ -186,12 +183,6 @@ def __init__(self, model_id: str):
 4. **内存管理**: 注意模型实例的内存占用，避免内存泄漏
 
 ## 故障排除
-
-### 常见问题
-
-1. **端口占用**: 修改`.env`文件中的`PORT`配置
-2. **模型池繁忙**: 增加`MODEL_POOL_SIZE`或优化模型处理速度
-3. **连接断开**: 检查网络稳定性和WebSocket配置
 
 ### 日志查看
 

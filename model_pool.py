@@ -16,7 +16,7 @@ class ModelManager:
     """模型管理器，负责管理单个模型实例的完整生命周期"""
     
     def __init__(self, manager_id: str):
-        checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/resources/video_hf/models/video_mllama_real_time"
+        checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/jihuai/real_time_chat/models/0808_1_3"
 
         self.processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True, frame_extract_num_threads=1)
 
@@ -164,7 +164,7 @@ class ModelManager:
             raise RuntimeError(error_msg)
         
         self.image_queue.put(image)
-        logger.info(f"管理器 {self.manager_id} 接收图片数据")
+        logger.info(f"管理器 {self.manager_id} 接收图片数据，当前队列为：{self.image_queue.qsize()}")
     
     def stop_session(self):
         """停止模型会话"""
