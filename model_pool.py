@@ -1,4 +1,3 @@
-import random
 import threading
 import time
 import logging
@@ -16,7 +15,7 @@ class ModelManager:
     """模型管理器，负责管理单个模型实例的完整生命周期"""
     
     def __init__(self, manager_id: str):
-        checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/jihuai/real_time_chat/models/0808_1_3"
+        checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/jihuai/real_time_chat/models/0808_1_1"
 
         self.processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True, frame_extract_num_threads=1)
 
@@ -40,6 +39,8 @@ class ModelManager:
         
         # 回调函数
         self._token_callback = None
+        
+        self.is_stop = True # 标识real_time_generate是否已停止
         
         logger.info(f"创建模型管理器: {manager_id}")
     
@@ -96,18 +97,14 @@ class ModelManager:
     def _generation_loop(self):
         """生成循环线程，负责调用模型的generate函数"""
         logger.info(f"管理器 {self.manager_id} 生成线程启动")
-        
+        # 标记开始生成
+        self.is_stop = False
         try:
             # 调用模型的generate函数，只调用一次
             # 函数内部会自己循环处理队列
             if hasattr(self.model_instance, 'real_time_generate'):
                 logger.info(f"管理器 {self.manager_id} 开始调用generate函数")
-                # TODO:
                 self.model_instance.real_time_generate(self.image_queue, self.prompt_queue, self.token_queue, self.processor, max_tokens_per_turn=86400, do_sample=False)
-                while True:
-                    # 随机往output_queue中放入token
-                    self.token_queue.put(f"token_{random.randint(1, 1000000)}")
-                    time.sleep(10)
             else:
                 error_msg = f"模型实例不支持generate方法"
                 logger.error(error_msg)
@@ -117,7 +114,11 @@ class ModelManager:
             logger.error(f"管理器 {self.manager_id} 生成线程出错: {e}")
             # 不再向token_queue放入错误信息，而是重新抛出异常
             raise e
-    
+        finally:
+            # 标记生成结束
+            self.is_stop = True
+            logger.info(f"管理器 {self.manager_id} 生成线程结束，已标记为停止")
+            
     def _monitor_loop(self):
         """监听循环线程，负责监听token队列并回调前端"""
         logger.info(f"管理器 {self.manager_id} 监听线程启动")
@@ -132,7 +133,7 @@ class ModelManager:
                     if self._token_callback:
                         self._token_callback(token)
                     
-                    logger.debug(f"管理器 {self.manager_id} 输出token: {token}")
+                    logger.info(f"管理器 {self.manager_id} 输出token: {token}")
                     
                     # 检查是否是结束标记
                     if token == "[DONE]" or token == "[ERROR]":
@@ -184,6 +185,24 @@ class ModelManager:
                 logger.info(f"调用模型 {self.manager_id} stop函数成功")
             except Exception as e:
                 logger.error(f"调用模型 {self.manager_id} stop函数失败: {e}")
+                raise RuntimeError(f"调用模型 {self.manager_id} stop函数失败: {e}")
+        
+        # 等待real_time_generate完成
+        logger.info(f"等待管理器 {self.manager_id} 的real_time_generate完成...")
+        timeout_count = 0
+        max_timeout = 30  # 最多等待30秒
+        
+        while not self.is_stop and timeout_count < max_timeout:
+            time.sleep(0.1)  # 每100ms检查一次
+            timeout_count += 0.1
+        
+        if not self.is_stop:
+            logger.warning(f"管理器 {self.manager_id} 等待real_time_generate完成超时，强制继续")
+            raise RuntimeError(f"管理器 {self.manager_id} 等待real_time_generate完成超时，强制继续")
+        else:
+            logger.info(f"管理器 {self.manager_id} 的real_time_generate已完成")
+            
+        with self._lock:
             
             # 等待线程结束
             if self._generate_thread and self._generate_thread.is_alive():

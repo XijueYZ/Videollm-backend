@@ -64,26 +64,6 @@ def status():
     }
 
 
-# 在所有发送消息的地方，统一使用这个安全的发送函数
-def safe_emit(event, data):
-    """安全地发送消息，处理连接断开的情况"""
-    client_id = request.sid
-    try:
-        # 检查客户端是否仍然活跃
-        with client_lock:
-            if client_id not in active_clients:
-                logger.debug(f"客户端 {client_id} 已断开，跳过消息发送")
-                return False
-        
-        socketio.emit(event, data)
-        return True
-    except Exception as e:
-        logger.error(f"发送消息失败: {e}")
-        # 从活跃连接中移除
-        with client_lock:
-            active_clients.discard(client_id)
-        return False
-
 def try_assign_model_to_waiting_clients():
     """尝试为等待中的客户端分配模型"""
     with client_lock:
@@ -109,7 +89,7 @@ def try_assign_model_to_waiting_clients():
             def token_callback(token):
                 """当模型生成新token时的回调"""
                 try:
-                    safe_emit('new_token', {'token': token})
+                    socketio.emit('new_token', {'token': token})
                     logger.debug(f"发送token给客户端 {client_id}: {token}")
                 except Exception as e:
                     logger.error(f"发送token失败: {e}")
@@ -127,7 +107,7 @@ def try_assign_model_to_waiting_clients():
             
             # 通知客户端分配成功
             try:
-                safe_emit('connected', {
+                socketio.emit('connected', {
                     'message': '连接成功',
                     'model_id': manager.manager_id,
                     'available_models': model_pool.available_count(),
@@ -147,7 +127,7 @@ def try_assign_model_to_waiting_clients():
             logger.error(f"为客户端 {client_id} 分配模型失败: {e}")
             
             try:
-                safe_emit('error', {'message': f'模型分配失败: {str(e)}'})
+                socketio.emit('error', {'message': f'模型分配失败: {str(e)}'})
             except (ConnectionError, Exception) as emit_error:
                 logger.error(f"向客户端 {client_id} 发送错误消息失败: {emit_error}")
                 with client_lock:
@@ -181,7 +161,7 @@ def handle_connect():
             
             # 通知客户端正在等待
             try:
-                safe_emit('waiting_for_model', {
+                socketio.emit('waiting_for_model', {
                     'message': '模型池繁忙，正在等待空闲模型...',
                     'queue_position': len(waiting_clients),
                     'available_models': model_pool.available_count(),
@@ -214,8 +194,7 @@ def handle_connect():
                         logger.debug(f"客户端 {client_id} 已断开，跳过token发送: {token}")
                         return
                 
-                # 使用 socketio.emit() 而不是 emit()，并指定 room
-                safe_emit('new_token', {'token': token})
+                socketio.emit('new_token', {'token': token})
                 logger.debug(f"发送token给客户端 {client_id}: {token}")
             except ConnectionError:
                 logger.warning(f"客户端 {client_id} 连接已断开，停止发送token")
@@ -239,7 +218,7 @@ def handle_connect():
         
         # 修复：使用 socketio.emit 而不是 emit
         try:
-            safe_emit('connected', {
+            socketio.emit('connected', {
                 'message': '连接成功',
                 'model_id': manager.manager_id,
                 'available_models': model_pool.available_count(),
@@ -261,7 +240,7 @@ def handle_connect():
         with client_lock:
             active_clients.discard(client_id)
         try:
-            safe_emit('error', {'message': f'连接失败: {str(e)}'})
+            socketio.emit('error', {'message': f'连接失败: {str(e)}'})
         except:
             logger.error(f"发送错误消息失败，客户端 {client_id} 可能已断开")
 
@@ -306,11 +285,11 @@ def handle_send_message(data):
     with client_lock:
         # 检查客户端是否在等待队列中
         if client_id in waiting_clients:
-            safe_emit('error', {'message': '正在等待模型分配，请稍后再试'})
+            socketio.emit('error', {'message': '正在等待模型分配，请稍后再试'})
             return
         
         if client_id not in client_managers:
-            safe_emit('error', {'message': '未找到分配的模型管理器'})
+            socketio.emit('error', {'message': '未找到分配的模型管理器'})
             return
         
         manager = client_managers[client_id]
@@ -318,7 +297,7 @@ def handle_send_message(data):
     try:
         message = data.get('message', '')
         if not message:
-            safe_emit('error', {'message': '消息内容不能为空'})
+            socketio.emit('error', {'message': '消息内容不能为空'})
             return
         
         logger.info(f"客户端 {client_id} 发送消息: {message[:50]}...")
@@ -328,7 +307,7 @@ def handle_send_message(data):
         
     except Exception as e:
         logger.error(f"处理消息失败: {e}")
-        safe_emit('error', {'message': f'消息处理失败: {str(e)}'})
+        socketio.emit('error', {'message': f'消息处理失败: {str(e)}'})
 
 
 @socketio.on('send_image')
@@ -339,11 +318,11 @@ def handle_send_image(data):
     with client_lock:
         # 检查客户端是否在等待队列中
         if client_id in waiting_clients:
-            safe_emit('error', {'message': '正在等待模型分配，请稍后再试'})
+            socketio.emit('error', {'message': '正在等待模型分配，请稍后再试'})
             return
         
         if client_id not in client_managers:
-            safe_emit('error', {'message': '未找到分配的模型管理器'})
+            socketio.emit('error', {'message': '未找到分配的模型管理器'})
             return
         
         manager = client_managers[client_id]
@@ -353,7 +332,7 @@ def handle_send_image(data):
         prompt = data.get('prompt', '')
         
         if not image_data:
-            safe_emit('error', {'message': '图片数据不能为空'})
+            socketio.emit('error', {'message': '图片数据不能为空'})
             return
         
         
@@ -367,7 +346,7 @@ def handle_send_image(data):
         except Exception as e:
             logger.error(f"图片解码失败: {e}")
             try:
-                safe_emit('error', {'message': '图片解码失败'})
+                socketio.emit('error', {'message': '图片解码失败'})
             except Exception as emit_error:
                 logger.error(f"发送错误消息失败: {emit_error}")
             return
@@ -381,9 +360,9 @@ def handle_send_image(data):
         
     except Exception as e:
         logger.error(f"处理图片失败: {e}")
-        safe_emit('error', {'message': f'图片处理失败: {str(e)}'})
+        socketio.emit('error', {'message': f'图片处理失败: {str(e)}'})
 
 
 if __name__ == '__main__':
     logger.info("启动VideoLLM后端服务...")
-    socketio.run(app, host='0.0.0.0', port=5001, debug=False)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
