@@ -89,7 +89,7 @@ def try_assign_model_to_waiting_clients():
             def token_callback(token):
                 """当模型生成新token时的回调"""
                 try:
-                    socketio.emit('new_token', {'token': token})
+                    socketio.emit('new_token', {'token': token}, room=client_id)
                     logger.debug(f"发送token给客户端 {client_id}: {token}")
                 except Exception as e:
                     logger.error(f"发送token失败: {e}")
@@ -121,13 +121,15 @@ def try_assign_model_to_waiting_clients():
                     if client_id in client_managers:
                         del client_managers[client_id]
                 model_pool.release_model(manager)
+                # 模型释放后，检查等待队列
+                try_assign_model_to_waiting_clients()
                 return
             
         except Exception as e:
             logger.error(f"为客户端 {client_id} 分配模型失败: {e}")
             
             try:
-                socketio.emit('error', {'message': f'模型分配失败: {str(e)}'})
+                socketio.emit('error', {'message': f'模型分配失败: {str(e)}'}, room=client_id)
             except (ConnectionError, Exception) as emit_error:
                 logger.error(f"向客户端 {client_id} 发送错误消息失败: {emit_error}")
                 with client_lock:
@@ -146,7 +148,9 @@ def handle_connect():
     
     try:
         # 尝试获取模型管理器
+        logger.info(f"客户端 {client_id} 正在获取模型管理器...")
         manager = model_pool.acquire_model(timeout=0.1)
+        logger.info(f"客户端 {client_id} 获取模型结果: {manager.manager_id if manager else 'None'}")
         
         
         if manager is None:
@@ -166,7 +170,7 @@ def handle_connect():
                     'queue_position': len(waiting_clients),
                     'available_models': model_pool.available_count(),
                     'total_models': model_pool.pool_size
-                })
+                }, room=client_id)
             except (ConnectionError, Exception) as e:
                 logger.error(f"向等待客户端 {client_id} 发送等待消息失败: {e}")
                 with client_lock:
@@ -175,12 +179,6 @@ def handle_connect():
                         del waiting_clients[client_id]
                 return
             
-            # 启动定期检查，为等待的客户端分配模型
-            def check_and_assign():
-                time.sleep(1)  # 延迟1秒再检查
-                try_assign_model_to_waiting_clients()
-            
-            threading.Thread(target=check_and_assign, daemon=True).start()
             return  # 不断开连接，保持等待状态
         
         # 有可用模型，直接分配
@@ -194,7 +192,7 @@ def handle_connect():
                         logger.debug(f"客户端 {client_id} 已断开，跳过token发送: {token}")
                         return
                 
-                socketio.emit('new_token', {'token': token})
+                socketio.emit('new_token', {'token': token}, room=client_id)
                 logger.debug(f"发送token给客户端 {client_id}: {token}")
             except ConnectionError:
                 logger.warning(f"客户端 {client_id} 连接已断开，停止发送token")
@@ -223,7 +221,7 @@ def handle_connect():
                 'model_id': manager.manager_id,
                 'available_models': model_pool.available_count(),
                 'wait_time': 0
-            })
+            }, room=client_id)
         except (ConnectionError, Exception) as e:
             logger.error(f"向客户端 {client_id} 发送连接成功消息失败: {e}")
             # 如果连接已断开，清理资源
@@ -232,6 +230,8 @@ def handle_connect():
                 if client_id in client_managers:
                     del client_managers[client_id]
             model_pool.release_model(manager)
+            # 模型释放后，检查等待队列
+            try_assign_model_to_waiting_clients()
             return
         
     except Exception as e:
@@ -240,7 +240,7 @@ def handle_connect():
         with client_lock:
             active_clients.discard(client_id)
         try:
-            socketio.emit('error', {'message': f'连接失败: {str(e)}'})
+            socketio.emit('error', {'message': f'连接失败: {str(e)}'}, room=client_id)
         except:
             logger.error(f"发送错误消息失败，客户端 {client_id} 可能已断开")
 
@@ -270,6 +270,9 @@ def handle_disconnect():
                 model_pool.release_model(manager)
                 logger.info(f"管理器 {manager.manager_id} 已释放")
                 
+                # 模型释放后，立即检查是否有等待的客户端可以分配
+                try_assign_model_to_waiting_clients()
+                
             except Exception as e:
                 logger.error(f"释放管理器 {manager.manager_id} 失败: {e}")
             
@@ -285,11 +288,11 @@ def handle_send_message(data):
     with client_lock:
         # 检查客户端是否在等待队列中
         if client_id in waiting_clients:
-            socketio.emit('error', {'message': '正在等待模型分配，请稍后再试'})
+            socketio.emit('error', {'message': '正在等待模型分配，请稍后再试'}, room=client_id)
             return
         
         if client_id not in client_managers:
-            socketio.emit('error', {'message': '未找到分配的模型管理器'})
+            socketio.emit('error', {'message': '未找到分配的模型管理器'}, room=client_id)
             return
         
         manager = client_managers[client_id]
@@ -297,7 +300,7 @@ def handle_send_message(data):
     try:
         message = data.get('message', '')
         if not message:
-            socketio.emit('error', {'message': '消息内容不能为空'})
+            socketio.emit('error', {'message': '消息内容不能为空'}, room=client_id)
             return
         
         logger.info(f"客户端 {client_id} 发送消息: {message[:50]}...")
@@ -307,7 +310,7 @@ def handle_send_message(data):
         
     except Exception as e:
         logger.error(f"处理消息失败: {e}")
-        socketio.emit('error', {'message': f'消息处理失败: {str(e)}'})
+        socketio.emit('error', {'message': f'消息处理失败: {str(e)}'}, room=client_id)
 
 
 @socketio.on('send_image')
@@ -318,11 +321,11 @@ def handle_send_image(data):
     with client_lock:
         # 检查客户端是否在等待队列中
         if client_id in waiting_clients:
-            socketio.emit('error', {'message': '正在等待模型分配，请稍后再试'})
+            socketio.emit('error', {'message': '正在等待模型分配，请稍后再试'}, room=client_id)
             return
         
         if client_id not in client_managers:
-            socketio.emit('error', {'message': '未找到分配的模型管理器'})
+            socketio.emit('error', {'message': '未找到分配的模型管理器'}, room=client_id)
             return
         
         manager = client_managers[client_id]
@@ -332,7 +335,7 @@ def handle_send_image(data):
         prompt = data.get('prompt', '')
         
         if not image_data:
-            socketio.emit('error', {'message': '图片数据不能为空'})
+            socketio.emit('error', {'message': '图片数据不能为空'}, room=client_id)
             return
         
         
@@ -346,7 +349,7 @@ def handle_send_image(data):
         except Exception as e:
             logger.error(f"图片解码失败: {e}")
             try:
-                socketio.emit('error', {'message': '图片解码失败'})
+                socketio.emit('error', {'message': '图片解码失败'}, room=client_id)
             except Exception as emit_error:
                 logger.error(f"发送错误消息失败: {emit_error}")
             return
@@ -360,7 +363,7 @@ def handle_send_image(data):
         
     except Exception as e:
         logger.error(f"处理图片失败: {e}")
-        socketio.emit('error', {'message': f'图片处理失败: {str(e)}'})
+        socketio.emit('error', {'message': f'图片处理失败: {str(e)}'}, room=client_id)
 
 
 if __name__ == '__main__':
