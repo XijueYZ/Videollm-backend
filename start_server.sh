@@ -1,7 +1,8 @@
 #!/bin/bash
 echo "启动VideoLLM后端服务..."
-gunicorn --worker-class eventlet \
+gunicorn --worker-class sync \
          -w 1 \
+         --threads 8 \
          --bind 0.0.0.0:5000 \
          --timeout 120 \
          --keep-alive 2 \

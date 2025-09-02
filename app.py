@@ -18,11 +18,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config.from_object(Config)
 
-# 初始化SocketIO
+# 初始化SocketIO - 使用 threading 模式
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
-    async_mode='eventlet',
+    async_mode='threading',  # 使用 threading 模式
     logger=False,
     engineio_logger=False,
     ping_timeout=30,
@@ -107,7 +107,10 @@ def handle_request_model(*args):
     data = args[0] if args else {}
     
     # 获取activeKey，如果没有传递则使用默认值
-    new_active_key = data.get('activeKey', 'default') if isinstance(data, dict) else 'default'
+    new_active_key = data.get('activeKey', 'None') if isinstance(data, dict) else 'None'
+    
+    if new_active_key == 'None':
+        return
         
     # 检查activeKey是否发生变化
     should_reassign = False
@@ -155,7 +158,6 @@ def handle_request_model(*args):
                 }, room=client_id)
                 return
 
-    # 在后台线程中处理模型分配，避免阻塞
     def assign_model():
         try:
             # 通知开始分配
@@ -210,8 +212,8 @@ def handle_request_model(*args):
                 'message': f'模型分配失败: {str(e)}',
                 'available_models': model_pool.available_count()
             }, room=client_id)
-    
-    # 启动后台线程
+
+    # 启动后台线程进行模型分配
     threading.Thread(target=assign_model, daemon=True).start()
 
 @socketio.on('release_model')
