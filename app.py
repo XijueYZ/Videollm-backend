@@ -148,15 +148,7 @@ def handle_request_model(*args):
     
     # 检查是否已经有模型（activeKey相同时）
     if not should_reassign:
-        with client_lock:
-            if client_id in client_managers:
-                socketio.emit('model_assigned', {
-                    'success': True,
-                    'model_id': client_managers[client_id].manager_id,
-                    'message': '模型已分配',
-                    'active_key': new_active_key
-                }, room=client_id)
-                return
+        return
 
     def assign_model():
         try:
