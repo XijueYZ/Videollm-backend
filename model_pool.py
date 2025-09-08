@@ -203,17 +203,24 @@ class ModelManager:
             logger.info(f"管理器 {self.manager_id} 的real_time_generate已完成")
             
         with self._lock:
-            
+            current_thread = threading.current_thread()
             # 等待线程结束
             if self._generate_thread and self._generate_thread.is_alive():
-                self._generate_thread.join(timeout=2.0)
-                if self._generate_thread.is_alive():
-                    logger.warning(f"管理器 {self.manager_id} 生成线程未能正常结束")
+                if self._generate_thread != current_thread:
+                    self._generate_thread.join(timeout=2.0)
+                    if self._generate_thread.is_alive():
+                        logger.warning(f"管理器 {self.manager_id} 生成线程未能正常结束")
+                else:
+                    logger.info(f"管理器 {self.manager_id} 跳过join生成线程（当前线程）")
             
             if self._monitor_thread and self._monitor_thread.is_alive():
-                self._monitor_thread.join(timeout=2.0)
-                if self._monitor_thread.is_alive():
-                    logger.warning(f"管理器 {self.manager_id} 监听线程未能正常结束")
+                if self._monitor_thread != current_thread:
+                    self._monitor_thread.join(timeout=2.0)
+                    if self._monitor_thread.is_alive():
+                        logger.warning(f"管理器 {self.manager_id} 监听线程未能正常结束")
+                else:
+                    logger.info(f"管理器 {self.manager_id} 跳过join监听线程（当前线程）")
+                        
             
             # 清空所有队列
             self._clear_queue(self.prompt_queue)

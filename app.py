@@ -27,6 +27,7 @@ socketio = SocketIO(
     engineio_logger=False,
     ping_timeout=30,
     ping_interval=10,
+    max_http_buffer_size=10*1024*1024,  # 10MB 缓冲区
     transports=['websocket', 'polling']
 )
 
@@ -44,8 +45,7 @@ active_key_lock = Lock()
 
 @app.route('/')
 def index():
-    with client_lock:
-        active_count = len(client_managers)
+    active_count = len(client_managers)
     
     return {
         'available_models': model_pool.available_count(),
@@ -56,8 +56,7 @@ def index():
 
 @app.route('/status')
 def status():
-    with client_lock:
-        active_count = len(client_managers)
+    active_count = len(client_managers)
     
     return {
         'available_models': model_pool.available_count(),
@@ -81,7 +80,7 @@ def handle_connect():
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    """处理客户端断连 - 简化版本"""
+    """处理客户端断连"""
     client_id = request.sid
     logger.info(f"❌ 客户端 {client_id} 断开连接")
     
@@ -215,9 +214,8 @@ def handle_release_model():
     logger.info(f"🔄 客户端 {client_id} 请求释放模型")
     
     manager_to_release = None
-    with client_lock:
-        if client_id in client_managers:
-            manager_to_release = client_managers.pop(client_id)
+    if client_id in client_managers:
+        manager_to_release = client_managers.pop(client_id)
     
     if manager_to_release:
         try:
@@ -245,11 +243,10 @@ def handle_send_message(data):
     client_id = request.sid
     
     # 检查是否有分配的模型
-    with client_lock:
-        if client_id not in client_managers:
-            socketio.emit('error', {'message': '请先请求模型分配'}, room=client_id)
-            return
-        manager = client_managers[client_id]
+    manager = client_managers.get(client_id)
+    if manager is None:
+        socketio.emit('error', {'message': '模型繁忙中，请稍后'}, room=client_id)
+        return
     
     try:
         message = data.get('message', '')
@@ -266,17 +263,68 @@ def handle_send_message(data):
         logger.error(f"❌ 处理消息失败: {e}")
         socketio.emit('error', {'message': f'消息处理失败: {str(e)}'}, room=client_id)
 
+@socketio.on('send_data')
+def handle_send_data(data):
+    """统一处理发送数据请求（支持文本、图片或两者）"""
+    client_id = request.sid
+    
+    # 快速获取manager（优化锁使用）
+    manager = client_managers.get(client_id)
+    if manager is None:
+        socketio.emit('error', {'message': '模型池繁忙，请稍后重试'}, room=client_id)
+        return
+    
+    try:
+        message = data.get('message', '').strip()
+        image_data = data.get('image_data')
+        
+        # 验证至少有一种数据
+        if not message and not image_data:
+            socketio.emit('error', {'message': '请提供文本消息或图片数据'}, room=client_id)
+            return
+        
+        # 处理图片（如果有）
+        image = None
+        if image_data:
+            try:
+                base64_data = re.sub('^data:image/.+;base64,', '', image_data)
+                image_bytes = base64.b64decode(base64_data)
+                image = Image.open(BytesIO(image_bytes))
+                logger.info(f"🖼️ 客户端 {client_id} 图片解码成功")
+            except Exception as e:
+                logger.error(f"❌ 图片解码失败: {e}")
+                socketio.emit('error', {'message': '图片解码失败'}, room=client_id)
+                return
+        
+        # 记录请求类型
+        if message and image:
+            logger.info(f"📝🖼️ 客户端 {client_id} 发送文本+图片: {message[:30]}...")
+        elif message:
+            logger.info(f"📝 客户端 {client_id} 发送消息: {message[:50]}...")
+        elif image:
+            logger.info(f"🖼️ 客户端 {client_id} 发送图片分析请求")
+        
+        # 按顺序添加到队列
+        if message:
+            manager.add_prompt(message)
+        if image:
+            manager.add_image(image)
+            
+    except Exception as e:
+        logger.error(f"❌ 处理数据失败: {e}")
+        socketio.emit('error', {'message': f'数据处理失败: {str(e)}'}, room=client_id)
+
 @socketio.on('send_image')
 def handle_send_image(data):
     """处理发送图片请求"""
     client_id = request.sid
     
     # 检查是否有分配的模型
-    with client_lock:
-        if client_id not in client_managers:
-            socketio.emit('error', {'message': '请先请求模型分配'}, room=client_id)
-            return
-        manager = client_managers[client_id]
+    # 无锁快速获取
+    manager = client_managers.get(client_id)
+    if manager is None:
+        socketio.emit('error', {'message': '请先请求模型分配'}, room=client_id)
+        return
     
     try:
         image_data = data.get('image_data')
