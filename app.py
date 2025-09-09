@@ -92,7 +92,10 @@ def handle_disconnect():
     
     if manager_to_release:
         try:
-            model_pool.release_model(manager_to_release)
+            model_pool.release_model(manager_to_release)                # 通知前端模型已释放
+            socketio.emit('has_model_released', {
+                'available_models': model_pool.available_count()
+            })
             logger.info(f"✅ 管理器 {manager_to_release.manager_id} 已释放")
         except Exception as e:
             logger.error(f"❌ 释放管理器失败: {e}")
@@ -121,15 +124,14 @@ def handle_request_model(*args):
             should_reassign = True
         else:
             logger.info(f"✅ 客户端 {client_id} activeKey未变化: {new_active_key}")
+    manager_to_release = None
+    with client_lock:
+        if client_id in client_managers:
+            manager_to_release = client_managers.pop(client_id) 
     
-        # 如果activeKey发生变化，释放现有模型
-    if should_reassign:
-        manager_to_release = None
-        with client_lock:
-            if client_id in client_managers:
-                manager_to_release = client_managers.pop(client_id)
-        
-        if manager_to_release:
+    if manager_to_release:  
+    # 如果activeKey发生变化，释放现有模型
+        if should_reassign:
             try:
                 model_pool.release_model(manager_to_release)
                 logger.info(f"🔄 因activeKey变化释放管理器 {manager_to_release.manager_id}")
@@ -143,11 +145,11 @@ def handle_request_model(*args):
                 
             except Exception as e:
                 logger.error(f"❌ 释放管理器失败: {e}")
+        
     
-    
-    # 检查是否已经有模型（activeKey相同时）
-    if not should_reassign:
-        return
+        # 检查是否已经有模型（activeKey相同时）
+        else:
+            return
 
     def assign_model():
         try:
@@ -207,62 +209,6 @@ def handle_request_model(*args):
     # 启动后台线程进行模型分配
     threading.Thread(target=assign_model, daemon=True).start()
 
-@socketio.on('release_model')
-def handle_release_model():
-    """处理模型释放请求 - 可选的显式释放"""
-    client_id = request.sid
-    logger.info(f"🔄 客户端 {client_id} 请求释放模型")
-    
-    manager_to_release = None
-    if client_id in client_managers:
-        manager_to_release = client_managers.pop(client_id)
-    
-    if manager_to_release:
-        try:
-            model_pool.release_model(manager_to_release)
-            logger.info(f"✅ 管理器 {manager_to_release.manager_id} 已释放")
-            socketio.emit('model_released', {
-                'success': True,
-                'message': '模型已释放'
-            }, room=client_id)
-        except Exception as e:
-            logger.error(f"❌ 释放管理器失败: {e}")
-            socketio.emit('model_released', {
-                'success': False,
-                'message': f'释放失败: {str(e)}'
-            }, room=client_id)
-    else:
-        socketio.emit('model_released', {
-            'success': False,
-            'message': '没有分配的模型'
-        }, room=client_id)
-
-@socketio.on('send_message')
-def handle_send_message(data):
-    """处理发送消息请求"""
-    client_id = request.sid
-    
-    # 检查是否有分配的模型
-    manager = client_managers.get(client_id)
-    if manager is None:
-        socketio.emit('error', {'message': '模型繁忙中，请稍后'}, room=client_id)
-        return
-    
-    try:
-        message = data.get('message', '')
-        if not message:
-            socketio.emit('error', {'message': '消息内容不能为空'}, room=client_id)
-            return
-        
-        logger.info(f"📝 客户端 {client_id} 发送消息: {message[:50]}...")
-        
-        # 将消息添加到管理器的prompt队列
-        manager.add_prompt(message)
-        
-    except Exception as e:
-        logger.error(f"❌ 处理消息失败: {e}")
-        socketio.emit('error', {'message': f'消息处理失败: {str(e)}'}, room=client_id)
-
 @socketio.on('send_data')
 def handle_send_data(data):
     """统一处理发送数据请求（支持文本、图片或两者）"""
@@ -313,47 +259,6 @@ def handle_send_data(data):
     except Exception as e:
         logger.error(f"❌ 处理数据失败: {e}")
         socketio.emit('error', {'message': f'数据处理失败: {str(e)}'}, room=client_id)
-
-@socketio.on('send_image')
-def handle_send_image(data):
-    """处理发送图片请求"""
-    client_id = request.sid
-    
-    # 检查是否有分配的模型
-    # 无锁快速获取
-    manager = client_managers.get(client_id)
-    if manager is None:
-        socketio.emit('error', {'message': '请先请求模型分配'}, room=client_id)
-        return
-    
-    try:
-        image_data = data.get('image_data')
-        prompt = data.get('prompt', '')
-        
-        if not image_data:
-            socketio.emit('error', {'message': '图片数据不能为空'}, room=client_id)
-            return
-        
-        # Convert base64 image data to PIL format
-        try:
-            base64_data = re.sub('^data:image/.+;base64,', '', image_data)
-            image_bytes = base64.b64decode(base64_data)
-            image = Image.open(BytesIO(image_bytes))
-        except Exception as e:
-            logger.error(f"❌ 图片解码失败: {e}")
-            socketio.emit('error', {'message': '图片解码失败'}, room=client_id)
-            return
-        
-        logger.info(f"🖼️ 客户端 {client_id} 发送图片分析请求")
-        
-        # 先添加prompt（如果有），再添加图片
-        if prompt:
-            manager.add_prompt(prompt)
-        manager.add_image(image)
-        
-    except Exception as e:
-        logger.error(f"❌ 处理图片失败: {e}")
-        socketio.emit('error', {'message': f'图片处理失败: {str(e)}'}, room=client_id)
 
 if __name__ == '__main__':
     logger.info("🚀 启动VideoLLM后端服务...")
