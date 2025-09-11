@@ -183,7 +183,7 @@ def handle_request_model(*args):
                     model_pool.release_model(manager)
             
             # 启动模型会话
-            manager.start_session(token_callback)
+            manager.start_session(token_callback, new_active_key)
             
             # 保存映射关系
             with client_lock:

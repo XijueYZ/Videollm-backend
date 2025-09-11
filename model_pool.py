@@ -43,8 +43,68 @@ class ModelManager:
         self.is_stop = True # 标识real_time_generate是否已停止
         
         logger.info(f"创建模型管理器: {manager_id}")
+
+    def start_session(self, token_callback: Callable[[str], None], new_active_key: str) -> bool:
+        """
+        启动模型会话
+        """
+        if new_active_key == "offline":
+            return self.start_offline_session(token_callback)
+        else:
+            return self.start_real_time_session(token_callback)
     
-    def start_session(self, token_callback: Callable[[str], None]) -> bool:
+    def start_offline_session(self, token_callback: Callable[[str], None]) -> bool:
+        """
+        启动离线理解会话
+        
+        Args:
+            token_callback: 接收新token的回调函数
+            
+        Returns:
+            是否成功启动
+            
+        Raises:
+            Exception: 当模型启动失败时抛出异常
+        """
+        with self._lock:
+            if self.is_active:
+                error_msg = f"管理器 {self.manager_id} 已处于活跃状态"
+                logger.warning(error_msg)
+                raise RuntimeError(error_msg)
+            
+            self.is_active = True
+            self._token_callback = token_callback
+            self._stop_event.clear()
+            
+            # 启动生成线程
+            self._generate_thread = threading.Thread(
+                target=self._offline_generation_loop,
+                name=f"Generate-{self.manager_id}",
+                daemon=True
+            )
+            
+            # 启动监听线程
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_loop,
+                name=f"Monitor-{self.manager_id}",
+                daemon=True
+            )
+            
+            try:
+                self._generate_thread.start()
+                self._monitor_thread.start()
+                
+                logger.info(f"模型管理器 {self.manager_id} 会话已启动")
+                return True
+                
+            except Exception as e:
+                error_msg = f"启动模型管理器 {self.manager_id} 失败: {e}"
+                logger.error(error_msg)
+                self.is_active = False
+                raise RuntimeError(error_msg)
+ 
+    
+    def start_real_time_session(self, token_callback: Callable[[str], None]) -> bool:
         """
         启动模型会话
         
@@ -94,6 +154,30 @@ class ModelManager:
                 self.is_active = False
                 raise RuntimeError(error_msg)
     
+    def _offline_generation_loop(self):
+        """离线理解循环线程，负责调用模型的offline_generate函数"""
+        logger.info(f"管理器 {self.manager_id} 离线理解线程启动")
+        # 标记开始理解
+        self.is_stop = False
+        try:
+            # 调用模型的offline_generate函数，只调用一次
+            if hasattr(self.model_instance, 'offline_generate'):
+                logger.info(f"管理器 {self.manager_id} 开始调用offline_generate函数")
+                self.model_instance.offline_generate(self.processor,self.image_queue, self.token_queue,max_tokens_per_turn=86400, do_sample=False)
+            else:
+                error_msg = f"模型实例不支持offline_generate方法"
+                logger.error(error_msg)
+                raise AttributeError(error_msg)
+        except Exception as e:
+            logger.error(f"管理器 {self.manager_id} 离线理解线程出错: {e}")
+            # 不再向token_queue放入错误信息，而是重新抛出异常
+            raise e
+        finally:
+            # 标记理解结束
+            self.is_stop = True
+            logger.info(f"管理器 {self.manager_id} 离线理解线程结束，已标记为停止")
+    
+
     def _generation_loop(self):
         """生成循环线程，负责调用模型的generate函数"""
         logger.info(f"管理器 {self.manager_id} 生成线程启动")
@@ -104,6 +188,10 @@ class ModelManager:
             # 函数内部会自己循环处理队列
             if hasattr(self.model_instance, 'real_time_generate'):
                 logger.info(f"管理器 {self.manager_id} 开始调用generate函数")
+                # mock一些回复
+                while True:
+                    self.token_queue.put("hello")
+                    time.sleep(1)
                 self.model_instance.real_time_generate(self.image_queue, self.prompt_queue, self.token_queue, self.processor, max_tokens_per_turn=86400, do_sample=False)
             else:
                 error_msg = f"模型实例不支持generate方法"
