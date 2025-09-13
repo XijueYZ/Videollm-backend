@@ -271,17 +271,17 @@ def handle_send_data(data):
         params = data.get('params')
         
         # 验证至少有一种数据
-        if send_type == 'chat':
+        if send_type == 'stream':
             if not message and not image_data:
                 socketio.emit('error', {'message': '请提供文本消息或图片数据'}, room=client_id)
                 return
-        elif send_type == 'stream':
+        elif send_type == 'chat':
             if not message and not images and not videos:
                 socketio.emit('error', {'message': '请提供文本消息、图片或视频数据'}, room=client_id)
                 return
         
         # 处理图片（如果有）
-        if send_type == 'chat':
+        if send_type == 'stream':
             image = None
             if image_data:
                 try:
@@ -309,7 +309,7 @@ def handle_send_data(data):
             if image:
                 manager.add_image(image)
         
-        elif send_type == 'stream':
+        elif send_type == 'chat':
             processed_images = []
             processed_videos = []
             
@@ -365,10 +365,12 @@ def handle_send_data(data):
                 'prompt': message,
                 'images': processed_images,
                 'videos': processed_videos,
+                'stop_offline_generate': False,
                 # 把params的内容放进来
             }
             if params:
                 new_queries.update(params)
+            logger.info(f"📦 客户端 {client_id} 上报参数：{new_queries}")
             
             # 这里可以添加将new_queries发送到模型处理队列的逻辑
             manager.add_offline_data(new_queries)

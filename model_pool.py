@@ -171,7 +171,7 @@ class ModelManager:
             # 调用模型的offline_generate函数，只调用一次
             if hasattr(self.model_instance, 'offline_generate'):
                 logger.info(f"管理器 {self.manager_id} 开始调用offline_generate函数")
-                self.model_instance.offline_generate(self.processor,self.offline_data_queue, self.token_queue,max_tokens_per_turn=86400, do_sample=False)
+                self.model_instance.offline_generate(self.processor, self.offline_data_queue, self.token_queue)
             else:
                 error_msg = f"模型实例不支持offline_generate方法"
                 logger.error(error_msg)
@@ -200,10 +200,6 @@ class ModelManager:
             # 函数内部会自己循环处理队列
             if hasattr(self.model_instance, 'real_time_generate'):
                 logger.info(f"管理器 {self.manager_id} 开始调用generate函数")
-                # mock一些回复
-                while True:
-                    self.token_queue.put("hello")
-                    time.sleep(1)
                 self.model_instance.real_time_generate(self.image_queue, self.prompt_queue, self.token_queue, self.processor, max_tokens_per_turn=86400, do_sample=False)
             else:
                 error_msg = f"模型实例不支持generate方法"
