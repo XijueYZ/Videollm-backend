@@ -65,7 +65,7 @@ socketio = SocketIO(
     engineio_logger=False,
     ping_timeout=30,
     ping_interval=10,
-    max_http_buffer_size=10*1024*1024,  # 10MB 缓冲区
+    max_http_buffer_size=100*1024*1024,  # 100MB 缓冲区，支持大视频文件
     transports=['websocket', 'polling']
 )
 
@@ -251,10 +251,28 @@ def handle_request_model(*args):
     # 启动后台线程进行模型分配
     threading.Thread(target=assign_model, daemon=True).start()
 
+@socketio.on_error()
+def error_handler(e):
+    """全局SocketIO错误处理器"""
+    client_id = request.sid if request else 'unknown'
+    logger.error(f"❌ SocketIO错误 (客户端 {client_id}): {e}")
+    logger.error(f"❌ 错误类型: {type(e)}")
+    import traceback
+    logger.error(f"❌ 错误堆栈: {traceback.format_exc()}")
+
 @socketio.on('send_data')
 def handle_send_data(data):
     """统一处理发送数据请求（支持文本、图片或两者）"""
     client_id = request.sid
+    logger.info(f"📨 收到客户端 {client_id} 的 send_data 请求")
+    
+    # 添加数据大小检查
+    try:
+        import sys
+        data_size = sys.getsizeof(data)
+        logger.info(f"📊 数据大小: {data_size / 1024 / 1024:.2f} MB")
+    except Exception as e:
+        logger.warning(f"⚠️ 无法计算数据大小: {e}")
     
     # 快速获取manager（优化锁使用）
     manager = client_managers.get(client_id)
@@ -269,6 +287,23 @@ def handle_send_data(data):
         images = data.get('images')
         videos = data.get('videos')
         params = data.get('params')
+        
+        # 调试信息：打印接收到的数据类型
+        if images:
+            logger.info(f"🔍 调试 - images类型: {type(images)}, 长度: {len(images) if hasattr(images, '__len__') else 'N/A'}")
+            for i, img in enumerate(images[:3]):  # 只打印前3个
+                logger.info(f"🔍 调试 - images[{i}]类型: {type(img)}, 大小: {len(img) if isinstance(img, (bytes, str)) else 'N/A'}")
+        if videos:
+            logger.info(f"🔍 调试 - videos类型: {type(videos)}, 长度: {len(videos) if hasattr(videos, '__len__') else 'N/A'}")
+            for i, vid in enumerate(videos[:3]):  # 只打印前3个
+                if isinstance(vid, dict):
+                    logger.info(f"🔍 调试 - videos[{i}]类型: {type(vid)}, 键: {list(vid.keys())}")
+                    if 'data' in vid:
+                        data_type = type(vid['data'])
+                        data_size = len(vid['data']) if hasattr(vid['data'], '__len__') else 'N/A'
+                        logger.info(f"🔍 调试 - videos[{i}].data类型: {data_type}, 大小: {data_size}")
+                else:
+                    logger.info(f"🔍 调试 - videos[{i}]类型: {type(vid)}, 大小: {len(vid) if isinstance(vid, (bytes, str)) else 'N/A'}")
         
         # 验证至少有一种数据
         if send_type == 'stream':
@@ -315,16 +350,38 @@ def handle_send_data(data):
             
             # 把image从File转化为Image
             if images:
-                for img_file in images:
+                for i, img_file in enumerate(images):
                     try:
-                        # 前端发送的是File对象，SocketIO会将其转换为FileStorage对象
+                        image = None
+                        filename = f"image_{i}"
+                        
+                        # 处理不同类型的图片数据
                         if hasattr(img_file, 'stream') and hasattr(img_file, 'filename'):
                             # 这是一个FileStorage对象
                             image = Image.open(img_file.stream)
-                            processed_images.append(image)
-                            logger.info(f"🖼️ 客户端 {client_id} 图片处理成功: {img_file.filename}")
+                            filename = img_file.filename
+                            logger.info(f"🖼️ 客户端 {client_id} 图片处理成功 (FileStorage): {filename}")
+                        elif isinstance(img_file, bytes):
+                            # 这是bytes数据
+                            image = Image.open(BytesIO(img_file))
+                            logger.info(f"🖼️ 客户端 {client_id} 图片处理成功 (bytes): {filename}")
+                        elif isinstance(img_file, str):
+                            # 这可能是base64数据
+                            try:
+                                base64_data = re.sub('^data:image/.+;base64,', '', img_file)
+                                image_bytes = base64.b64decode(base64_data)
+                                image = Image.open(BytesIO(image_bytes))
+                                logger.info(f"🖼️ 客户端 {client_id} 图片处理成功 (base64): {filename}")
+                            except Exception as e:
+                                logger.error(f"❌ base64图片解码失败: {e}")
+                                continue
                         else:
                             logger.warning(f"⚠️ 不支持的图片格式: {type(img_file)}")
+                            continue
+                        
+                        if image:
+                            processed_images.append(image)
+                            
                     except Exception as e:
                         logger.error(f"❌ 图片处理失败: {e}")
                         continue
@@ -333,25 +390,85 @@ def handle_send_data(data):
             if videos:
                 for i, video_file in enumerate(videos):
                     try:
-                        # 前端发送的是File对象，SocketIO会将其转换为FileStorage对象
+                        original_filename = f"video_{i}.mp4"
+                        file_ext = '.mp4'
+                        video_data = None
+                        
+                        # 处理不同类型的视频数据
                         if hasattr(video_file, 'stream') and hasattr(video_file, 'filename'):
-                            # 从原始文件名获取扩展名
+                            # 这是一个FileStorage对象
                             original_filename = video_file.filename
                             file_ext = os.path.splitext(original_filename)[1] if original_filename else '.mp4'
+                            video_file.stream.seek(0)  # 确保从头开始读取
+                            video_data = video_file.stream.read()
+                            logger.info(f"🎥 客户端 {client_id} 视频处理成功 (FileStorage): {original_filename}")
+                        elif isinstance(video_file, dict) and 'data' in video_file:
+                            # 这是前端发送的对象格式: {name, type, size, data}
+                            original_filename = video_file.get('name', f'video_{i}.mp4')
+                            file_type = video_file.get('type', 'video/mp4')
+                            file_size = video_file.get('size', 0)
                             
+                            # 从MIME类型推断文件扩展名
+                            if file_type.startswith('video/'):
+                                mime_type = file_type.split('/')[-1]
+                                if mime_type == 'quicktime':
+                                    file_ext = '.mov'
+                                elif mime_type in ['mp4', 'avi', 'webm', 'mkv', 'flv', 'wmv']:
+                                    file_ext = f'.{mime_type}'
+                                else:
+                                    file_ext = '.mp4'
+                            else:
+                                file_ext = os.path.splitext(original_filename)[1] if original_filename else '.mp4'
+                            
+                            # 处理arrayBuffer数据
+                            array_buffer_data = video_file['data']
+                            if isinstance(array_buffer_data, (list, tuple)):
+                                # arrayBuffer可能被转换为数组
+                                video_data = bytes(array_buffer_data)
+                            elif isinstance(array_buffer_data, bytes):
+                                video_data = array_buffer_data
+                            elif isinstance(array_buffer_data, str):
+                                # 可能是base64编码的数据
+                                try:
+                                    video_data = base64.b64decode(array_buffer_data)
+                                except:
+                                    logger.error(f"❌ 无法解码视频数据")
+                                    continue
+                            else:
+                                logger.error(f"❌ 不支持的arrayBuffer数据类型: {type(array_buffer_data)}")
+                                continue
+                            
+                            logger.info(f"🎥 客户端 {client_id} 视频处理成功 (对象格式): {original_filename}, 类型: {file_type}, 大小: {file_size}字节")
+                        elif isinstance(video_file, bytes):
+                            # 这是bytes数据
+                            video_data = video_file
+                            logger.info(f"🎥 客户端 {client_id} 视频处理成功 (bytes): {original_filename}")
+                        elif isinstance(video_file, str):
+                            # 这可能是base64数据
+                            try:
+                                base64_data = re.sub('^data:video/.+;base64,', '', video_file)
+                                video_data = base64.b64decode(base64_data)
+                                logger.info(f"🎥 客户端 {client_id} 视频处理成功 (base64): {original_filename}")
+                            except Exception as e:
+                                logger.error(f"❌ base64视频解码失败: {e}")
+                                continue
+                        else:
+                            logger.warning(f"⚠️ 不支持的视频格式: {type(video_file)}")
+                            logger.info(f"🔍 视频数据内容预览: {str(video_file)[:200]}...")
+                            continue
+                        
+                        if video_data:
                             # 生成唯一文件名：client_id_随机字符串_索引.扩展名
                             filename = f"{client_id}_{uuid.uuid4().hex[:8]}_{i}{file_ext}"
                             filepath = os.path.join(TEMP_DIR, filename)
                             
-                            # 直接保存视频文件
+                            # 保存视频文件
                             with open(filepath, 'wb') as f:
-                                video_file.stream.seek(0)  # 确保从头开始读取
-                                f.write(video_file.stream.read())
+                                f.write(video_data)
                             
                             processed_videos.append(filepath)
                             logger.info(f"🎥 客户端 {client_id} 视频保存成功: {filename} (原文件: {original_filename})")
-                        else:
-                            logger.warning(f"⚠️ 不支持的视频格式: {type(video_file)}")
+                            
                     except Exception as e:
                         logger.error(f"❌ 视频处理失败: {e}")
                         continue
