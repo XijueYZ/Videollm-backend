@@ -1,7 +1,7 @@
 import re
 import os
 import uuid
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from flask_socketio import SocketIO
 from threading import Lock
 import logging      
@@ -102,6 +102,57 @@ def status():
         'active_connections': active_count,
         'status': model_pool.get_pool_status()
     }
+
+@app.route('/api/upload-video', methods=['POST'])
+def upload_video():
+    """处理视频文件上传"""
+    try:
+        client_id = request.form.get('socket_id')
+        # 检查是否有文件上传
+        if 'video' not in request.files:
+            return jsonify({'error': '没有找到视频文件'}), 400
+        
+        video_file = request.files['video']
+        if video_file.filename == '':
+            return jsonify({'error': '没有选择文件'}), 400
+        
+        # 获取文件信息
+        original_filename = request.form.get('filename', video_file.filename)
+        file_size = request.form.get('filesize', 0)
+        
+        # 验证文件类型
+        if not video_file.content_type or not video_file.content_type.startswith('video/'):
+            return jsonify({'error': '文件类型不是视频格式'}), 400
+        
+        # 生成唯一文件名
+        file_ext = os.path.splitext(original_filename)[1] if original_filename else '.mp4'
+        unique_filename = f"{client_id}_{int(time.time())}{file_ext}"
+        file_path = os.path.join(TEMP_DIR, unique_filename)
+        
+        # 保存文件
+        video_file.save(file_path)
+        
+        # 验证文件是否保存成功
+        if not os.path.exists(file_path):
+            return jsonify({'error': '文件保存失败'}), 500
+        
+        saved_size = os.path.getsize(file_path)
+        logger.info(f"🎥 视频上传成功: {original_filename} -> {unique_filename}, 大小: {saved_size / 1024 / 1024:.2f} MB")
+        
+        return jsonify({
+            'success': True,
+            'filePath': file_path,
+            'path': file_path,  # 兼容不同的字段名
+            'originalName': original_filename,
+            'savedName': unique_filename,
+            'size': saved_size,
+            'message': '视频上传成功'
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ 视频上传失败: {e}")
+        return jsonify({'error': f'上传失败: {str(e)}'}), 500
+
 
 @socketio.on('connect')
 def handle_connect():
@@ -386,89 +437,20 @@ def handle_send_data(data):
                         logger.error(f"❌ 图片处理失败: {e}")
                         continue
             
-            # 把video从File保存到本地某个临时文件夹里，带request.sid
+            # 处理视频路径（前端通过HTTP接口上传后发送路径）
             if videos:
-                for i, video_file in enumerate(videos):
+                for i, video_item in enumerate(videos):
                     try:
-                        original_filename = f"video_{i}.mp4"
-                        file_ext = '.mp4'
-                        video_data = None
-                        
-                        # 处理不同类型的视频数据
-                        if hasattr(video_file, 'stream') and hasattr(video_file, 'filename'):
-                            # 这是一个FileStorage对象
-                            original_filename = video_file.filename
-                            file_ext = os.path.splitext(original_filename)[1] if original_filename else '.mp4'
-                            video_file.stream.seek(0)  # 确保从头开始读取
-                            video_data = video_file.stream.read()
-                            logger.info(f"🎥 客户端 {client_id} 视频处理成功 (FileStorage): {original_filename}")
-                        elif isinstance(video_file, dict) and 'data' in video_file:
-                            # 这是前端发送的对象格式: {name, type, size, data}
-                            original_filename = video_file.get('name', f'video_{i}.mp4')
-                            file_type = video_file.get('type', 'video/mp4')
-                            file_size = video_file.get('size', 0)
-                            
-                            # 从MIME类型推断文件扩展名
-                            if file_type.startswith('video/'):
-                                mime_type = file_type.split('/')[-1]
-                                if mime_type == 'quicktime':
-                                    file_ext = '.mov'
-                                elif mime_type in ['mp4', 'avi', 'webm', 'mkv', 'flv', 'wmv']:
-                                    file_ext = f'.{mime_type}'
-                                else:
-                                    file_ext = '.mp4'
+                        if isinstance(video_item, dict) and 'path' in video_item:
+                            # 这是包含路径的对象格式: {path: '/path/to/video', name: 'xxx'}
+                            video_path = video_item['path']
+                            original_name = video_item.get('name', f'video_{i}')
+                            if os.path.exists(video_path):
+                                processed_videos.append(video_path)
+                                logger.info(f"🎥 客户端 {client_id} 视频路径已确认: {video_path} (原名: {original_name})")
                             else:
-                                file_ext = os.path.splitext(original_filename)[1] if original_filename else '.mp4'
-                            
-                            # 处理arrayBuffer数据
-                            array_buffer_data = video_file['data']
-                            if isinstance(array_buffer_data, (list, tuple)):
-                                # arrayBuffer可能被转换为数组
-                                video_data = bytes(array_buffer_data)
-                            elif isinstance(array_buffer_data, bytes):
-                                video_data = array_buffer_data
-                            elif isinstance(array_buffer_data, str):
-                                # 可能是base64编码的数据
-                                try:
-                                    video_data = base64.b64decode(array_buffer_data)
-                                except:
-                                    logger.error(f"❌ 无法解码视频数据")
-                                    continue
-                            else:
-                                logger.error(f"❌ 不支持的arrayBuffer数据类型: {type(array_buffer_data)}")
-                                continue
-                            
-                            logger.info(f"🎥 客户端 {client_id} 视频处理成功 (对象格式): {original_filename}, 类型: {file_type}, 大小: {file_size}字节")
-                        elif isinstance(video_file, bytes):
-                            # 这是bytes数据
-                            video_data = video_file
-                            logger.info(f"🎥 客户端 {client_id} 视频处理成功 (bytes): {original_filename}")
-                        elif isinstance(video_file, str):
-                            # 这可能是base64数据
-                            try:
-                                base64_data = re.sub('^data:video/.+;base64,', '', video_file)
-                                video_data = base64.b64decode(base64_data)
-                                logger.info(f"🎥 客户端 {client_id} 视频处理成功 (base64): {original_filename}")
-                            except Exception as e:
-                                logger.error(f"❌ base64视频解码失败: {e}")
-                                continue
-                        else:
-                            logger.warning(f"⚠️ 不支持的视频格式: {type(video_file)}")
-                            logger.info(f"🔍 视频数据内容预览: {str(video_file)[:200]}...")
-                            continue
-                        
-                        if video_data:
-                            # 生成唯一文件名：client_id_随机字符串_索引.扩展名
-                            filename = f"{client_id}_{uuid.uuid4().hex[:8]}_{i}{file_ext}"
-                            filepath = os.path.join(TEMP_DIR, filename)
-                            
-                            # 保存视频文件
-                            with open(filepath, 'wb') as f:
-                                f.write(video_data)
-                            
-                            processed_videos.append(filepath)
-                            logger.info(f"🎥 客户端 {client_id} 视频保存成功: {filename} (原文件: {original_filename})")
-                            
+                                logger.error(f"❌ 视频文件不存在: {video_path}")
+                                continue  
                     except Exception as e:
                         logger.error(f"❌ 视频处理失败: {e}")
                         continue
