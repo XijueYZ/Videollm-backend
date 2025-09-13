@@ -1,4 +1,6 @@
 import re
+import os
+import uuid
 from flask import Flask, request
 from flask_socketio import SocketIO
 from threading import Lock
@@ -17,6 +19,42 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config.from_object(Config)
+
+# 创建临时文件夹
+TEMP_DIR = os.path.join(os.getcwd(), 'temp_uploads')
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+def cleanup_temp_files(client_id=None, max_age_hours=24):
+    """清理临时文件"""
+    try:
+        current_time = time.time()
+        for filename in os.listdir(TEMP_DIR):
+            filepath = os.path.join(TEMP_DIR, filename)
+            
+            # 如果指定了client_id，只清理该客户端的文件
+            if client_id and not filename.startswith(f"{client_id}_"):
+                continue
+                
+            # 检查文件年龄
+            file_age = current_time - os.path.getctime(filepath)
+            if file_age > max_age_hours * 3600:  # 转换为秒
+                os.remove(filepath)
+                logger.info(f"🗑️ 清理过期临时文件: {filename}")
+                
+    except Exception as e:
+        logger.error(f"❌ 清理临时文件失败: {e}")
+
+# 启动定期清理任务
+def start_cleanup_task():
+    """启动定期清理任务"""
+    def cleanup_worker():
+        while True:
+            time.sleep(3600)  # 每小时清理一次
+            cleanup_temp_files()
+    
+    threading.Thread(target=cleanup_worker, daemon=True).start()
+
+start_cleanup_task()
 
 # 初始化SocketIO - 使用 threading 模式
 socketio = SocketIO(
@@ -99,6 +137,9 @@ def handle_disconnect():
             logger.info(f"✅ 管理器 {manager_to_release.manager_id} 已释放")
         except Exception as e:
             logger.error(f"❌ 释放管理器失败: {e}")
+    
+    # 清理该客户端的临时文件
+    cleanup_temp_files(client_id=client_id)
 
 @socketio.on('request_model')
 def handle_request_model(*args):
@@ -221,44 +262,129 @@ def handle_send_data(data):
         return
     
     try:
+        send_type = data.get('type', 'chat')
         message = data.get('message', '').strip()
         image_data = data.get('image_data')
+        images = data.get('images')
+        videos = data.get('videos')
+        params = data.get('params')
         
         # 验证至少有一种数据
-        if not message and not image_data:
-            socketio.emit('error', {'message': '请提供文本消息或图片数据'}, room=client_id)
-            return
-        
-        # 处理图片（如果有）
-        image = None
-        if image_data:
-            try:
-                base64_data = re.sub('^data:image/.+;base64,', '', image_data)
-                image_bytes = base64.b64decode(base64_data)
-                image = Image.open(BytesIO(image_bytes))
-                logger.info(f"🖼️ 客户端 {client_id} 图片解码成功")
-            except Exception as e:
-                logger.error(f"❌ 图片解码失败: {e}")
-                socketio.emit('error', {'message': '图片解码失败'}, room=client_id)
+        if send_type == 'chat':
+            if not message and not image_data:
+                socketio.emit('error', {'message': '请提供文本消息或图片数据'}, room=client_id)
+                return
+        elif send_type == 'stream':
+            if not message and not images and not videos:
+                socketio.emit('error', {'message': '请提供文本消息、图片或视频数据'}, room=client_id)
                 return
         
-        # 记录请求类型
-        if message and image:
-            logger.info(f"📝🖼️ 客户端 {client_id} 发送文本+图片: {message[:30]}...")
-        elif message:
-            logger.info(f"📝 客户端 {client_id} 发送消息: {message[:50]}...")
-        elif image:
-            logger.info(f"🖼️ 客户端 {client_id} 发送图片分析请求")
+        # 处理图片（如果有）
+        if send_type == 'chat':
+            image = None
+            if image_data:
+                try:
+                    base64_data = re.sub('^data:image/.+;base64,', '', image_data)
+                    image_bytes = base64.b64decode(base64_data)
+                    image = Image.open(BytesIO(image_bytes))
+                    logger.info(f"🖼️ 客户端 {client_id} 图片解码成功")
+                except Exception as e:
+                    logger.error(f"❌ 图片解码失败: {e}")
+                    socketio.emit('error', {'message': '图片解码失败'}, room=client_id)
+                    return
+            
+            
+            # 记录请求类型
+            if message and image:
+                logger.info(f"📝🖼️ 客户端 {client_id} 发送文本+图片: {message[:30]}...")
+            elif message:
+                logger.info(f"📝 客户端 {client_id} 发送消息: {message[:50]}...")
+            elif image:
+                logger.info(f"🖼️ 客户端 {client_id} 发送图片分析请求")
+            
+            # 按顺序添加到队列
+            if message:
+                manager.add_prompt(message)
+            if image:
+                manager.add_image(image)
         
-        # 按顺序添加到队列
-        if message:
-            manager.add_prompt(message)
-        if image:
-            manager.add_image(image)
+        elif send_type == 'stream':
+            processed_images = []
+            processed_videos = []
+            
+            # 把image从File转化为Image
+            if images:
+                for img_file in images:
+                    try:
+                        # 前端发送的是File对象，SocketIO会将其转换为FileStorage对象
+                        if hasattr(img_file, 'stream') and hasattr(img_file, 'filename'):
+                            # 这是一个FileStorage对象
+                            image = Image.open(img_file.stream)
+                            processed_images.append(image)
+                            logger.info(f"🖼️ 客户端 {client_id} 图片处理成功: {img_file.filename}")
+                        else:
+                            logger.warning(f"⚠️ 不支持的图片格式: {type(img_file)}")
+                    except Exception as e:
+                        logger.error(f"❌ 图片处理失败: {e}")
+                        continue
+            
+            # 把video从File保存到本地某个临时文件夹里，带request.sid
+            if videos:
+                for i, video_file in enumerate(videos):
+                    try:
+                        # 前端发送的是File对象，SocketIO会将其转换为FileStorage对象
+                        if hasattr(video_file, 'stream') and hasattr(video_file, 'filename'):
+                            # 从原始文件名获取扩展名
+                            original_filename = video_file.filename
+                            file_ext = os.path.splitext(original_filename)[1] if original_filename else '.mp4'
+                            
+                            # 生成唯一文件名：client_id_随机字符串_索引.扩展名
+                            filename = f"{client_id}_{uuid.uuid4().hex[:8]}_{i}{file_ext}"
+                            filepath = os.path.join(TEMP_DIR, filename)
+                            
+                            # 直接保存视频文件
+                            with open(filepath, 'wb') as f:
+                                video_file.stream.seek(0)  # 确保从头开始读取
+                                f.write(video_file.stream.read())
+                            
+                            processed_videos.append(filepath)
+                            logger.info(f"🎥 客户端 {client_id} 视频保存成功: {filename} (原文件: {original_filename})")
+                        else:
+                            logger.warning(f"⚠️ 不支持的视频格式: {type(video_file)}")
+                    except Exception as e:
+                        logger.error(f"❌ 视频处理失败: {e}")
+                        continue
+            
+            # 记录处理结果
+            if processed_images or processed_videos:
+                logger.info(f"📦 客户端 {client_id} stream处理完成: {len(processed_images)}张图片, {len(processed_videos)}个视频")
+            
+            # 把image和video添加到队列
+            new_queries = {
+                'prompt': message,
+                'images': processed_images,
+                'videos': processed_videos,
+                # 把params的内容放进来
+            }
+            if params:
+                new_queries.update(params)
+            
+            # 这里可以添加将new_queries发送到模型处理队列的逻辑
+            manager.add_offline_data(new_queries)
             
     except Exception as e:
         logger.error(f"❌ 处理数据失败: {e}")
         socketio.emit('error', {'message': f'数据处理失败: {str(e)}'}, room=client_id)
+
+
+@socketio.on('pause_offline_output')
+def handle_pause_offline_generate():
+    """处理暂停离线理解请求"""
+    client_id = request.sid
+    manager = client_managers.get(client_id)
+    if manager is None:
+        return
+    manager.pause_offline_generate()
 
 if __name__ == '__main__':
     logger.info("🚀 启动VideoLLM后端服务...")

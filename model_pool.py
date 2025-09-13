@@ -26,11 +26,15 @@ class ModelManager:
         self.created_at = time.time()
         self.last_used = time.time()
         
-        # 三个队列
+        # 两个实时视频入参队列
         self.prompt_queue = Queue()  # 存放前端发送的prompt
         self.image_queue = Queue()   # 存放前端发送的图片
+
+        # 一个离线入参队列
+        self.offline_data_queue = Queue()
+
         self.token_queue = Queue()   # 存放模型生成的token
-        
+
         # 线程控制
         self._generate_thread = None
         self._monitor_thread = None
@@ -39,6 +43,8 @@ class ModelManager:
         
         # 回调函数
         self._token_callback = None
+
+        self.type = "chat"
         
         self.is_stop = True # 标识real_time_generate是否已停止
         
@@ -48,9 +54,11 @@ class ModelManager:
         """
         启动模型会话
         """
-        if new_active_key == "offline":
+        if new_active_key == "chat":
+            self.type = "chat"
             return self.start_offline_session(token_callback)
         else:
+            self.type = "stream"
             return self.start_real_time_session(token_callback)
     
     def start_offline_session(self, token_callback: Callable[[str], None]) -> bool:
@@ -163,7 +171,7 @@ class ModelManager:
             # 调用模型的offline_generate函数，只调用一次
             if hasattr(self.model_instance, 'offline_generate'):
                 logger.info(f"管理器 {self.manager_id} 开始调用offline_generate函数")
-                self.model_instance.offline_generate(self.processor,self.image_queue, self.token_queue,max_tokens_per_turn=86400, do_sample=False)
+                self.model_instance.offline_generate(self.processor,self.offline_data_queue, self.token_queue,max_tokens_per_turn=86400, do_sample=False)
             else:
                 error_msg = f"模型实例不支持offline_generate方法"
                 logger.error(error_msg)
@@ -177,6 +185,10 @@ class ModelManager:
             self.is_stop = True
             logger.info(f"管理器 {self.manager_id} 离线理解线程结束，已标记为停止")
     
+    def pause_offline_generate(self):
+        """暂停离线理解"""
+        logger.info(f"管理器 {self.manager_id} 暂停离线理解")
+        self.model_instance.stop_real_time_generate()
 
     def _generation_loop(self):
         """生成循环线程，负责调用模型的generate函数"""
@@ -246,7 +258,7 @@ class ModelManager:
         logger.info(f"管理器 {self.manager_id} 接收prompt: {prompt[:50]}...")
     
     def add_image(self, image: Any):
-        """添加图片到队列"""
+        """实时模式下，添加图片到队列"""
         if not self.is_active:
             error_msg = f"管理器 {self.manager_id} 未启动"
             logger.error(error_msg)
@@ -254,6 +266,16 @@ class ModelManager:
         
         self.image_queue.put(image)
         logger.info(f"管理器 {self.manager_id} 接收图片数据，当前队列为：{self.image_queue.qsize()}")
+    
+    def add_offline_data(self, data: Any):
+        """离线模式下，添加图片、视频和参数到队列"""
+        if not self.is_active:
+            error_msg = f"管理器 {self.manager_id} 未启动"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        self.offline_data_queue.put(data)
+        logger.info(f"管理器 {self.manager_id} 接收数据，当前队列为：{self.offline_data_queue.qsize()}")
     
     def stop_session(self):
         """停止模型会话"""
@@ -269,14 +291,20 @@ class ModelManager:
             
             # 调用模型的stop函数
             try:
-                self.model_instance.stop_real_time_generate()
-                logger.info(f"调用模型 {self.manager_id} stop函数成功")
+                if self.type == "chat":
+                    self.add_offline_data({
+                        "stop_offline_generate": True
+                    })
+                    logger.info(f"模型 {self.manager_id} 传递stop_offline_generate信号")
+                else:
+                    self.model_instance.stop_real_time_generate()
+                    logger.info(f"调用模型 {self.manager_id} stop函数成功")
             except Exception as e:
                 logger.error(f"调用模型 {self.manager_id} stop函数失败: {e}")
                 raise RuntimeError(f"调用模型 {self.manager_id} stop函数失败: {e}")
         
         # 等待real_time_generate完成
-        logger.info(f"等待管理器 {self.manager_id} 的real_time_generate完成...")
+        logger.info(f"等待管理器 {self.manager_id} 的generate完成...")
         timeout_count = 0
         max_timeout = 30  # 最多等待30秒
         
@@ -339,7 +367,8 @@ class ModelManager:
             'queue_sizes': {
                 'prompt_queue': self.prompt_queue.qsize(),
                 'image_queue': self.image_queue.qsize(),
-                'token_queue': self.token_queue.qsize()
+                'token_queue': self.token_queue.qsize(),
+                'offline_data_queue': self.offline_data_queue.qsize()
             },
             'threads_alive': {
                 'generate': self._generate_thread.is_alive() if self._generate_thread else False,
