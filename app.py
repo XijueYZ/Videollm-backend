@@ -121,7 +121,8 @@ def handle_disconnect():
     """处理客户端断连"""
     client_id = request.sid
     logger.info(f"❌ 客户端 {client_id} 断开连接")
-    
+    with active_key_lock:
+        client_active_keys.pop(client_id)
     # 检查并释放模型
     manager_to_release = None
     with client_lock:
