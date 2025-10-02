@@ -14,12 +14,24 @@ logger = logging.getLogger(__name__)
 class ModelManager:
     """模型管理器，负责管理单个模型实例的完整生命周期"""
     
-    def __init__(self, manager_id: str):
+    def __init__(self, manager_id: str, frame_extract_num_threads = 1, gpu_id = None):
         checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/jihuai/real_time_chat/models/0913_1_1_1_w_1_0"
+        self.processor = AutoProcessor.from_pretrained(
+            checkpoint,
+            trust_remote_code=True,
+            frame_extract_num_threads=frame_extract_num_threads
+        )
+            
+        self.model_instance = AutoModelForCausalLM.from_pretrained(
+            checkpoint,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            device_map={"": f"cuda:{gpu_id}"}  # 确保整个模型都在指定GPU上
+        )
+        # self.processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True, frame_extract_num_threads=1)
 
-        self.processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True, frame_extract_num_threads=1)
-
-        self.model_instance = AutoModelForCausalLM.from_pretrained(checkpoint, trust_remote_code=True, device_map="auto", torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+        # self.model_instance = AutoModelForCausalLM.from_pretrained(checkpoint, trust_remote_code=True, device_map="auto", torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
 
         self.manager_id = manager_id
         self.is_active = False
@@ -393,8 +405,10 @@ class ModelPool:
         """初始化模型池"""
         for i in range(self.pool_size):
             manager_id = f"manager_{i+1}_{uuid.uuid4().hex[:8]}"
+            gpu_id = i
+            frame_extract_num_threads = 1
             
-            manager = ModelManager(manager_id)
+            manager = ModelManager(manager_id, frame_extract_num_threads, gpu_id)
             self._all_managers.append(manager)
             self._available_managers.put(manager)
     
