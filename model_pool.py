@@ -15,7 +15,7 @@ class ModelManager:
     """模型管理器，负责管理单个模型实例的完整生命周期"""
     
     def __init__(self, manager_id: str):
-        checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/jihuai/real_time_chat/models/0808_1_1"
+        checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/jihuai/real_time_chat/models/0913_1_1_1_w_1_0"
 
         self.processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True, frame_extract_num_threads=1)
 
@@ -200,7 +200,7 @@ class ModelManager:
             # 函数内部会自己循环处理队列
             if hasattr(self.model_instance, 'real_time_generate'):
                 logger.info(f"管理器 {self.manager_id} 开始调用generate函数")
-                self.model_instance.real_time_generate(self.image_queue, self.prompt_queue, self.token_queue, self.processor, max_tokens_per_turn=86400, do_sample=False)
+                self.model_instance.real_time_generate(self.image_queue, self.prompt_queue, self.token_queue, self.processor, max_tokens_per_turn=86400, do_sample=True)
             else:
                 error_msg = f"模型实例不支持generate方法"
                 logger.error(error_msg)

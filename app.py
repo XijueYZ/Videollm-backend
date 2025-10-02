@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config.from_object(Config)
 
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
+
 # 创建临时文件夹
 TEMP_DIR = os.path.join(os.getcwd(), 'temp_uploads')
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -107,6 +109,7 @@ def status():
 def upload_video():
     """处理视频文件上传"""
     try:
+        logger.info('视频上传开始')
         client_id = request.form.get('socket_id')
         # 检查是否有文件上传
         if 'video' not in request.files:
@@ -152,8 +155,7 @@ def upload_video():
     except Exception as e:
         logger.error(f"❌ 视频上传失败: {e}")
         return jsonify({'error': f'上传失败: {str(e)}'}), 500
-
-
+ 
 @socketio.on('connect')
 def handle_connect():
     """处理客户端连接 - 只处理连接，不分配模型"""
@@ -168,10 +170,10 @@ def handle_connect():
     }, room=client_id)
 
 @socketio.on('disconnect')
-def handle_disconnect():
+def handle_disconnect(reason):
     """处理客户端断连"""
     client_id = request.sid
-    logger.info(f"❌ 客户端 {client_id} 断开连接")
+    logger.info(f"❌ 客户端 {client_id} 断开连接，原因是：{reason}")
     with active_key_lock:
         client_active_keys.pop(client_id)
     # 检查并释放模型
