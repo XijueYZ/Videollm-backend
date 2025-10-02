@@ -15,28 +15,16 @@ class ModelManager:
     """模型管理器，负责管理单个模型实例的完整生命周期"""
     
     def __init__(self, manager_id: str, frame_extract_num_threads = 1, gpu_id = None):
-        checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/jihuai/real_time_chat/models/0913_1_1_1_w_1_0"
-        self.processor = AutoProcessor.from_pretrained(
-            checkpoint,
-            trust_remote_code=True,
-            frame_extract_num_threads=frame_extract_num_threads
-        )
-            
-        self.model_instance = AutoModelForCausalLM.from_pretrained(
-            checkpoint,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            device_map={"": f"cuda:{gpu_id}"}  # 确保整个模型都在指定GPU上
-        )
-        # self.processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True, frame_extract_num_threads=1)
-
-        # self.model_instance = AutoModelForCausalLM.from_pretrained(checkpoint, trust_remote_code=True, device_map="auto", torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
-
         self.manager_id = manager_id
         self.is_active = False
         self.created_at = time.time()
         self.last_used = time.time()
+        
+        # 保存初始化参数，用于重新初始化
+        self._init_params = {
+            'frame_extract_num_threads': frame_extract_num_threads,
+            'gpu_id': gpu_id
+        }
         
         # 两个实时视频入参队列
         self.prompt_queue = Queue()  # 存放前端发送的prompt
@@ -59,8 +47,43 @@ class ModelManager:
         self.type = "chat"
         
         self.is_stop = True # 标识real_time_generate是否已停止
+        self._is_healthy = True  # 健康状态标记
+        
+        # 初始化模型
+        self._load_model()
         
         logger.info(f"创建模型管理器: {manager_id}")
+
+    def _load_model(self):
+        """加载模型实例"""
+        try:
+            checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/jihuai/real_time_chat/models/0913_1_1_1_w_1_0"
+            self.processor = AutoProcessor.from_pretrained(
+                checkpoint,
+                trust_remote_code=True,
+                frame_extract_num_threads=self._init_params['frame_extract_num_threads']
+            )
+                
+            self.model_instance = AutoModelForCausalLM.from_pretrained(
+                checkpoint,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",
+                device_map={"": f"cuda:{self._init_params['gpu_id']}"}
+            )
+            
+            self._is_healthy = True
+            logger.info(f"模型管理器 {self.manager_id} 模型加载成功")
+            
+        except Exception as e:
+            self._is_healthy = False
+            logger.error(f"模型管理器 {self.manager_id} 模型加载失败: {e}")
+            raise e
+
+    def _handle_model_exception(self, exception: Exception):
+        """处理模型异常，标记为不健康状态"""
+        logger.error(f"模型管理器 {self.manager_id} 发生异常: {exception}")
+        self._is_healthy = False
 
     def start_session(self, token_callback: Callable[[str], None], new_active_key: str) -> bool:
         """
@@ -190,7 +213,7 @@ class ModelManager:
                 raise AttributeError(error_msg)
         except Exception as e:
             logger.error(f"管理器 {self.manager_id} 离线理解线程出错: {e}")
-            # 不再向token_queue放入错误信息，而是重新抛出异常
+            self._handle_model_exception(e)
             raise e
         finally:
             # 标记理解结束
@@ -220,7 +243,7 @@ class ModelManager:
                 
         except Exception as e:
             logger.error(f"管理器 {self.manager_id} 生成线程出错: {e}")
-            # 不再向token_queue放入错误信息，而是重新抛出异常
+            self._handle_model_exception(e)
             raise e
         finally:
             # 标记生成结束
@@ -384,6 +407,38 @@ class ModelManager:
             }
         }
 
+    def is_healthy(self) -> bool:
+        """检查模型是否健康"""
+        return self._is_healthy
+
+    def reset_model(self):
+        """重置模型实例"""
+        logger.info(f"重置模型管理器 {self.manager_id}")
+        
+        # 停止当前会话
+        if self.is_active:
+            self.stop_session()
+        
+        # 清理旧模型资源
+        try:
+            if hasattr(self, 'model_instance'):
+                del self.model_instance
+            if hasattr(self, 'processor'):
+                del self.processor
+        except:
+            pass
+        
+        # 重新加载模型
+        self._load_model()
+        
+        # 清空队列
+        self._clear_queue(self.prompt_queue)
+        self._clear_queue(self.image_queue)
+        self._clear_queue(self.token_queue)
+        self._clear_queue(self.offline_data_queue)
+        
+        logger.info(f"模型管理器 {self.manager_id} 重置完成")
+
 
 class ModelPool:
     """模型池，只负责模型的分发和回收"""
@@ -425,6 +480,16 @@ class ModelPool:
         try:
             manager = self._available_managers.get(timeout=timeout)
             
+            # 检查管理器是否健康，如果不健康则尝试重置
+            if not manager.is_healthy():
+                logger.warning(f"管理器 {manager.manager_id} 不健康，尝试重置")
+                try:
+                    manager.reset_model()
+                except Exception as e:
+                    logger.error(f"重置管理器 {manager.manager_id} 失败: {e}")
+                    # 重置失败，不放回可用池
+                    return None
+            
             with self._lock:
                 self._active_managers[manager.manager_id] = manager
             
@@ -450,6 +515,19 @@ class ModelPool:
             # 停止会话
             manager.stop_session()
             
+            # 检查管理器是否健康，如果不健康则尝试重置
+            if not manager.is_healthy():
+                logger.warning(f"管理器 {manager.manager_id} 不健康，尝试重置")
+                try:
+                    manager.reset_model()
+                except Exception as e:
+                    logger.error(f"重置管理器 {manager.manager_id} 失败: {e}")
+                    # 重置失败，从活跃列表中移除但不放回可用池
+                    with self._lock:
+                        if manager.manager_id in self._active_managers:
+                            del self._active_managers[manager.manager_id]
+                    return
+            
             with self._lock:
                 # 从活跃列表中移除
                 if manager.manager_id in self._active_managers:
@@ -462,6 +540,10 @@ class ModelPool:
             
         except Exception as e:
             logger.error(f"回收模型管理器失败 {manager.manager_id}: {e}")
+            # 如果回收失败，从活跃列表中移除但不放回可用池
+            with self._lock:
+                if manager.manager_id in self._active_managers:
+                    del self._active_managers[manager.manager_id]
     
     def available_count(self) -> int:
         """获取可用模型数量"""
