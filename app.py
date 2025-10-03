@@ -1,7 +1,8 @@
 import re
 import os
+import shutil
 import uuid
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_socketio import SocketIO
 from flask_cors import CORS  # 添加这行
 from threading import Lock
@@ -31,41 +32,68 @@ app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 # 初始化数据库
 init_database(app)
 
-# 创建临时文件夹
-TEMP_DIR = os.path.join(os.getcwd(), 'temp_uploads')
+# 创建保存图片和视频的文件夹
+# 放在当前文件夹的父级文件夹下
+TEMP_DIR = os.path.join(os.path.dirname(os.getcwd()), 'temp_uploads')
 os.makedirs(TEMP_DIR, exist_ok=True)
+logger.info(f"📁 TEMP_DIR路径: {TEMP_DIR}")
 
-def cleanup_temp_files(client_id=None, max_age_hours=24):
-    """清理临时文件"""
+# 添加静态文件服务
+@app.route('/temp_uploads/<path:filename>')
+def serve_temp_file(filename):
+    """提供临时文件访问"""
     try:
-        current_time = time.time()
-        for filename in os.listdir(TEMP_DIR):
-            filepath = os.path.join(TEMP_DIR, filename)
-            
-            # 如果指定了client_id，只清理该客户端的文件
-            if client_id and not filename.startswith(f"{client_id}_"):
-                continue
-                
-            # 检查文件年龄
-            file_age = current_time - os.path.getctime(filepath)
-            if file_age > max_age_hours * 3600:  # 转换为秒
-                os.remove(filepath)
-                logger.info(f"🗑️ 清理过期临时文件: {filename}")
-                
+        file_path = os.path.join(TEMP_DIR, filename)
+        logger.info(f"🔍 请求临时文件: {filename}")
+        logger.info(f"🔍 完整路径: {file_path}")
+        logger.info(f"🔍 文件是否存在: {os.path.exists(file_path)}")
+        
+        if not os.path.exists(file_path):
+            logger.warning(f"❌ 临时文件不存在: {file_path}")
+            return jsonify({'error': '文件不存在'}), 404
+        
+        # 根据文件扩展名设置正确的MIME类型
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+            return send_file(file_path, mimetype='image/*')
+        elif filename.lower().endswith(('.mp4', '.webm', '.ogg')):
+            return send_file(file_path, mimetype='video/*')
+        else:
+            return jsonify({'error': '不支持的文件类型'}), 400
     except Exception as e:
-        logger.error(f"❌ 清理临时文件失败: {e}")
+        logger.error(f"获取临时文件失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# def cleanup_temp_files(client_id=None, max_age_hours=24):
+#     """清理临时文件"""
+#     try:
+#         current_time = time.time()
+#         for filename in os.listdir(TEMP_DIR):
+#             filepath = os.path.join(TEMP_DIR, filename)
+            
+#             # 如果指定了client_id，只清理该客户端的文件
+#             if client_id and not filename.startswith(f"{client_id}_"):
+#                 continue
+                
+#             # 检查文件年龄
+#             file_age = current_time - os.path.getctime(filepath)
+#             if file_age > max_age_hours * 3600:  # 转换为秒
+#                 os.remove(filepath)
+#                 logger.info(f"🗑️ 清理过期临时文件: {filename}")
+                
+#     except Exception as e:
+#         logger.error(f"❌ 清理临时文件失败: {e}")
 
 # 启动定期清理任务
-def start_cleanup_task():
-    """启动定期清理任务"""
-    def cleanup_worker():
-        while True:
-            time.sleep(3600)  # 每小时清理一次
-            cleanup_temp_files()
+# def start_cleanup_task():
+#     """启动定期清理任务"""
+#     def cleanup_worker():
+#         while True:
+#             time.sleep(3600)  # 每小时清理一次
+#             cleanup_temp_files()
     
-    threading.Thread(target=cleanup_worker, daemon=True).start()
+#     threading.Thread(target=cleanup_worker, daemon=True).start()
 
-start_cleanup_task()
+# start_cleanup_task()
 
 # 初始化SocketIO - 使用 threading 模式
 socketio = SocketIO(
@@ -131,10 +159,13 @@ def upload_video():
         if not video_file.content_type or not video_file.content_type.startswith('video/'):
             return jsonify({'error': '文件类型不是视频格式'}), 400
         
+        # 生成文件夹：客户端_日期
+        folder_name = f"{client_id}_{int(time.time())}"
+        os.makedirs(os.path.join(TEMP_DIR, folder_name), exist_ok=True)
         # 生成唯一文件名
         file_ext = os.path.splitext(original_filename)[1] if original_filename else '.mp4'
-        unique_filename = f"{client_id}_{int(time.time())}{file_ext}"
-        file_path = os.path.join(TEMP_DIR, unique_filename)
+        unique_filename = f"video_{uuid.uuid4()}{file_ext}"
+        file_path = os.path.join(TEMP_DIR, folder_name, unique_filename)
         
         # 保存文件
         video_file.save(file_path)
@@ -254,11 +285,43 @@ def delete_conversation_api(conversation_id):
     """删除对话"""
     try:
         logger.info(f"删除对话: {conversation_id}")
+        # 先把对话列表中相关的文件删除，再删除对话
+        messages = get_conversation_messages(conversation_id)
+        for message in messages:
+            if message.get('files'):
+                files_info = json.loads(message['files'])
+                if 'images' in files_info:
+                    for img in files_info['images']:
+                        os.remove(img['path'])
+                if 'videos' in files_info:
+                    for vid in files_info['videos']:
+                        os.remove(vid['path'])
+        # NOTE: 理论上这里应该把变成空了的文件夹删掉，但是考虑到没有快捷有效的方式，而遍历可能更加耗时，空文件夹又没有影响，所以暂时没有做
         delete_conversation(app, conversation_id)
         return jsonify({'success': True})
     except Exception as e:
         logger.error(f"删除对话失败: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/files/<path:filename>')
+def get_file(filename):
+    """获取保存的媒体文件"""
+    try:
+        file_path = os.path.join(TEMP_DIR, filename)
+        if not os.path.exists(file_path):
+            return jsonify({'error': '文件不存在'}), 404
+        
+        # 根据文件扩展名设置正确的MIME类型
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+            
+            return send_file(file_path, mimetype='image/*')
+        elif filename.lower().endswith(('.mp4', '.webm', '.ogg')):
+            return send_file(file_path, mimetype='video/*')
+        else:
+            return jsonify({'error': '不支持的文件类型'}), 400
+    except Exception as e:
+        logger.error(f"获取文件失败: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @socketio.on('connect')
 def handle_connect():
@@ -291,9 +354,6 @@ def handle_disconnect(reason):
             logger.info(f"✅ 管理器 {manager_to_release.manager_id} 已释放")
         except Exception as e:
             logger.error(f"❌ 释放管理器失败: {e}")
-    
-    # 清理该客户端的临时文件
-    cleanup_temp_files(client_id=client_id)
 
 @socketio.on_error()
 def error_handler(e):
@@ -414,12 +474,13 @@ def handle_send_data(data):
             processed_images = []
             processed_videos = []
             
-            # 把image从File转化为Image
+            # 把image从File转化为Image并保存到临时文件夹
+            saved_image_paths = []
             if images:
                 for i, img_file in enumerate(images):
                     try:
                         image = None
-                        filename = f"image_{i}"
+                        filename = f"image_{uuid.uuid4()}_{i}"
                         
                         # 处理不同类型的图片数据
                         if hasattr(img_file, 'stream') and hasattr(img_file, 'filename'):
@@ -446,6 +507,28 @@ def handle_send_data(data):
                             continue
                         
                         if image:
+                            # 保存图片到临时文件夹
+                            try:
+                                # 生成文件夹：客户端_日期
+                                folder_name = f"{client_id}_{int(time.time())}"
+                                os.makedirs(os.path.join(TEMP_DIR, folder_name), exist_ok=True)
+                                # 生成唯一的文件名
+                                file_ext = '.png'  # 默认使用PNG格式保存
+                                unique_filename = f"image_{uuid.uuid4()}_{i}{file_ext}"
+                                file_path = os.path.join(TEMP_DIR, folder_name, unique_filename)
+                                
+                                # 保存图片
+                                image.save(file_path)
+                                saved_image_paths.append({
+                                    'path': file_path,
+                                    'name': filename
+                                })
+                                logger.info(f"🖼️ 图片已保存: {file_path}")
+                            except Exception as e:
+                                logger.error(f"❌ 保存图片失败: {e}")
+                                continue
+                            
+                            # 添加到processed_images用于模型处理
                             processed_images.append(image)
                             
                     except Exception as e:
@@ -491,12 +574,20 @@ def handle_send_data(data):
             
             # 保存用户消息到数据库
             files_info = None
-            if images or videos:
+            if saved_image_paths or processed_videos:
                 files_info = json.dumps({
-                    'images': len(images) if images else 0,
-                    'videos': len(videos) if videos else 0
+                    'images': [{
+                        'path': img_info['path'],
+                        'name': img_info['name']
+                    } for img_info in saved_image_paths],
+                    'videos': [{
+                        'path': video_path,
+                        'name': os.path.basename(video_path)
+                    } for video_path in processed_videos]
                 })
-            add_message_to_conversation(app, conversation_id, 'user', message, False, files_info)
+           
+            if message or processed_images or processed_videos:
+                add_message_to_conversation(app, conversation_id, 'user', message, False, files_info)
             
     except Exception as e:
         logger.error(f"❌ 处理数据失败: {e}")
