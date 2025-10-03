@@ -3,6 +3,7 @@ import os
 import uuid
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO
+from flask_cors import CORS  # 添加这行
 from threading import Lock
 import logging      
 import time
@@ -12,6 +13,8 @@ from config import Config
 import base64
 from io import BytesIO
 from PIL import Image
+from database import db, init_database, create_conversation, get_conversation, get_conversations, get_conversation_messages, add_message_to_conversation, update_conversation_title, delete_conversation
+import json
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -20,7 +23,13 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config.from_object(Config)
 
+# 添加CORS支持
+CORS(app, origins="*", allow_headers=["Content-Type", "Authorization"], supports_credentials=True)
+
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
+
+# 初始化数据库
+init_database(app)
 
 # 创建临时文件夹
 TEMP_DIR = os.path.join(os.getcwd(), 'temp_uploads')
@@ -77,11 +86,6 @@ model_pool = ModelPool(pool_size=1)
 # 简化的状态管理 - 只维护客户端到模型管理器的映射
 client_managers = {}
 client_lock = Lock()
-
-# 添加客户端activeKey跟踪
-client_active_keys = {}  # 跟踪每个客户端的activeKey
-active_key_lock = Lock()
-
 
 @app.route('/')
 def index():
@@ -156,6 +160,106 @@ def upload_video():
         logger.error(f"❌ 视频上传失败: {e}")
         return jsonify({'error': f'上传失败: {str(e)}'}), 500
  
+
+@app.route('/api/conversations', methods=['GET'])
+def get_conversations_api():
+    """获取对话列表"""
+    try:
+        conversation_type = request.args.get('type')  # 'chat' 或 'stream'
+        conversations = get_conversations(conversation_type)
+        return jsonify({
+            'success': True,
+            'conversations': conversations
+        })
+    except Exception as e:
+        logger.error(f"获取对话列表失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/conversations/<conversation_id>/messages', methods=['GET'])
+def get_conversation_messages_api(conversation_id):
+    """获取对话消息"""
+    try:
+        messages = get_conversation_messages(conversation_id)
+        return jsonify({
+            'success': True,
+            'messages': messages
+        })
+    except Exception as e:
+        logger.error(f"获取对话消息失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/conversations', methods=['POST'])
+def create_conversation_api():
+    """ 创建新对话 """
+    """ title: 对话标题, type: 对话类型, conversationId: 对话ID"""
+    try:
+        data = request.get_json()
+        title = data.get('title', '新对话')
+        conversation_type = data.get('type', 'chat')
+        
+        conversation_id = create_conversation(conversation_id=str(uuid.uuid4()), title=title, conversation_type=conversation_type)
+        # 
+        
+        return jsonify({
+            'success': True,
+            'conversationId': conversation_id
+        })
+    except Exception as e:
+        logger.error(f"创建对话失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/conversations/<conversation_id>/title', methods=['PUT'])
+def update_conversation_title_api(conversation_id):
+    """更新对话标题"""
+    try:
+        data = request.get_json()
+        title = data.get('title')
+        
+        if not title:
+            return jsonify({'success': False, 'error': '标题不能为空'}), 400
+        
+        update_conversation_title(app, conversation_id, title)
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        logger.error(f"更新对话标题失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/conversations/<conversation_id>/content', methods=['PUT'])
+def update_conversation_content_api(conversation_id):
+    """更新对话内容"""
+    """
+    is_user: 是否是用户消息
+    is_error: 是否是错误消息
+    content: 消息内容
+    """
+    try:
+        data = request.get_json()
+        is_user = data.get('is_user')
+        is_error = data.get('is_error')
+        content = data.get('content')
+        
+        if not content:
+            return jsonify({'success': False, 'error': '内容不能为空'}), 400
+        
+        add_message_to_conversation(app, conversation_id, 'user' if is_user else 'robot', content, is_error)
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        logger.error(f"更新对话标题失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/conversations/<conversation_id>', methods=['DELETE'])
+def delete_conversation_api(conversation_id):
+    """删除对话"""
+    try:
+        logger.info(f"删除对话: {conversation_id}")
+        delete_conversation(app, conversation_id)
+        return jsonify({'success': True})
+    except Exception as e:
+        logger.error(f"删除对话失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @socketio.on('connect')
 def handle_connect():
     """处理客户端连接 - 只处理连接，不分配模型"""
@@ -174,8 +278,7 @@ def handle_disconnect(reason):
     """处理客户端断连"""
     client_id = request.sid
     logger.info(f"❌ 客户端 {client_id} 断开连接，原因是：{reason}")
-    with active_key_lock:
-        client_active_keys.pop(client_id)
+    
     # 检查并释放模型
     manager_to_release = None
     with client_lock:
@@ -184,125 +287,13 @@ def handle_disconnect(reason):
     
     if manager_to_release:
         try:
-            model_pool.release_model(manager_to_release)                # 通知前端模型已释放
-            socketio.emit('has_model_released', {
-                'available_models': model_pool.available_count()
-            })
+            model_pool.release_model(manager_to_release)
             logger.info(f"✅ 管理器 {manager_to_release.manager_id} 已释放")
         except Exception as e:
             logger.error(f"❌ 释放管理器失败: {e}")
     
     # 清理该客户端的临时文件
     cleanup_temp_files(client_id=client_id)
-
-@socketio.on('request_model')
-def handle_request_model(*args):
-    """处理模型分配请求 - 新的独立事件"""
-    client_id = request.sid
-    logger.info(f"📋 客户端 {client_id} 请求模型分配：{args}")
-
-    data = args[0] if args else {}
-    
-    # 获取activeKey，如果没有传递则使用默认值
-    new_active_key = data.get('activeKey', 'None') if isinstance(data, dict) else 'None'
-    
-    if new_active_key == 'None':
-        return
-        
-    # 检查activeKey是否发生变化
-    should_reassign = False
-    with active_key_lock:
-        old_active_key = client_active_keys.get(client_id)
-        if old_active_key != new_active_key:
-            logger.info(f"🔄 客户端 {client_id} activeKey变化: {old_active_key} -> {new_active_key}")
-            client_active_keys[client_id] = new_active_key
-            should_reassign = True
-        else:
-            logger.info(f"✅ 客户端 {client_id} activeKey未变化: {new_active_key}")
-    manager_to_release = None
-    with client_lock:
-        if client_id in client_managers:
-            manager_to_release = client_managers.pop(client_id) 
-    
-    if manager_to_release:  
-    # 如果activeKey发生变化，释放现有模型
-        if should_reassign:
-            try:
-                model_pool.release_model(manager_to_release)
-                logger.info(f"🔄 因activeKey变化释放管理器 {manager_to_release.manager_id}")
-                
-                # 通知前端模型已释放
-                socketio.emit('model_released_for_switch', {
-                    'old_active_key': old_active_key,
-                    'new_active_key': new_active_key,
-                    'message': f'切换到 {new_active_key}，正在重新分配模型...'
-                }, room=client_id)
-                
-            except Exception as e:
-                logger.error(f"❌ 释放管理器失败: {e}")
-        
-    
-        # 检查是否已经有模型（activeKey相同时）
-        else:
-            return
-
-    def assign_model():
-        try:
-            # 通知开始分配
-            socketio.emit('model_assigning', {
-                'message': '正在分配模型...',
-                'available_models': model_pool.available_count()
-            }, room=client_id)
-            
-            # 尝试获取模型 - 可以设置更长的超时时间
-            manager = model_pool.acquire_model(timeout=30)  # 30秒超时
-            
-            if manager is None:
-                socketio.emit('model_assign_failed', {
-                    'message': '模型池繁忙，请稍后重试',
-                    'available_models': model_pool.available_count()
-                }, room=client_id)
-                return
-            
-            # 定义token回调函数
-            def token_callback(token):
-                try:
-                    socketio.emit('new_token', {'token': token}, room=client_id)
-                    logger.debug(f"发送token给客户端 {client_id}: {token}")
-                except Exception as e:
-                    logger.error(f"发送token失败: {e}")
-                    # 如果发送失败，说明客户端可能已断开
-                    with client_lock:
-                        if client_id in client_managers:
-                            del client_managers[client_id]
-                    model_pool.release_model(manager)
-            
-            # 启动模型会话
-            manager.start_session(token_callback, new_active_key)
-            
-            # 保存映射关系
-            with client_lock:
-                client_managers[client_id] = manager
-            
-            logger.info(f"✅ 客户端 {client_id} 成功分配到管理器 {manager.manager_id}")
-            
-            # 通知分配成功
-            socketio.emit('model_assigned', {
-                'success': True,
-                'model_id': manager.manager_id,
-                'message': '模型分配成功',
-                'available_models': model_pool.available_count()
-            }, room=client_id)
-            
-        except Exception as e:
-            logger.error(f"❌ 为客户端 {client_id} 分配模型失败: {e}")
-            socketio.emit('model_assign_failed', {
-                'message': f'模型分配失败: {str(e)}',
-                'available_models': model_pool.available_count()
-            }, room=client_id)
-
-    # 启动后台线程进行模型分配
-    threading.Thread(target=assign_model, daemon=True).start()
 
 @socketio.on_error()
 def error_handler(e):
@@ -316,8 +307,28 @@ def error_handler(e):
 @socketio.on('send_data')
 def handle_send_data(data):
     """统一处理发送数据请求（支持文本、图片或两者）"""
+    """
+    conversationId: 对话ID
+    type: 请求类型
+    message: 文本消息
+    image_data: 图片数据(实时场景)
+    images: 图片列表（离线场景）
+    videos: 视频列表（离线场景）
+    params: 参数
+    """
     client_id = request.sid
     logger.info(f"📨 收到客户端 {client_id} 的 send_data 请求")
+    # 从请求中获取conversation_id
+    conversation_id = data.get('conversationId')
+    if not conversation_id:
+        socketio.emit('error', {'message': '缺少conversationId参数'}, room=client_id)
+        return
+
+     # 验证对话是否存在
+    conversation = get_conversation(conversation_id)
+    if not conversation:
+        socketio.emit('error', {'message': f'对话 {conversation_id} 不存在'}, room=client_id)
+        return
     
     # 添加数据大小检查
     try:
@@ -326,6 +337,7 @@ def handle_send_data(data):
         logger.info(f"📊 数据大小: {data_size / 1024 / 1024:.2f} MB")
     except Exception as e:
         logger.warning(f"⚠️ 无法计算数据大小: {e}")
+    
     
     # 快速获取manager（优化锁使用）
     manager = client_managers.get(client_id)
@@ -394,6 +406,7 @@ def handle_send_data(data):
             # 按顺序添加到队列
             if message:
                 manager.add_prompt(message)
+                add_message_to_conversation(app, conversation_id, 'user', message, False, None)
             if image:
                 manager.add_image(image)
         
@@ -476,8 +489,19 @@ def handle_send_data(data):
             # 这里可以添加将new_queries发送到模型处理队列的逻辑
             manager.add_offline_data(new_queries)
             
+            # 保存用户消息到数据库
+            files_info = None
+            if images or videos:
+                files_info = json.dumps({
+                    'images': len(images) if images else 0,
+                    'videos': len(videos) if videos else 0
+                })
+            add_message_to_conversation(app, conversation_id, 'user', message, False, files_info)
+            
     except Exception as e:
         logger.error(f"❌ 处理数据失败: {e}")
+        # 保存错误消息
+        add_message_to_conversation(app, conversation_id, 'robot', f'数据处理失败: {str(e)}', True)
         socketio.emit('error', {'message': f'数据处理失败: {str(e)}'}, room=client_id)
 
 
@@ -489,6 +513,129 @@ def handle_pause_offline_generate():
     if manager is None:
         return
     manager.pause_offline_generate()
+
+# 在现有代码基础上添加这个新的HTTP接口
+@app.route('/api/allocate-model', methods=['POST'])
+def allocate_model():
+    """处理模型分配请求 - 新的独立事件"""
+    """
+    activeKey: 客户端的activeKey
+    conversationId: 对话ID
+    sid: 客户端Socket ID
+    """
+    try:
+        data = request.get_json()
+        # 从请求中获取socket_id
+        client_id = data.get('sid', None)
+        
+        logger.info(f"📋 客户端 {client_id} 请求模型分配：{data}")
+        
+        if not client_id:
+            return jsonify({'error': '缺少socket_id参数'}), 400
+            
+        # 获取activeKey，如果没有传递则使用默认值
+        new_active_key = data.get('activeKey', 'None') if isinstance(data, dict) else 'None'
+        
+        if new_active_key == 'None':
+            return
+            
+        manager_to_release = None
+        with client_lock:
+            if client_id in client_managers:
+                manager_to_release = client_managers.pop(client_id) 
+        
+        if manager_to_release:  
+            try:
+                model_pool.release_model(manager_to_release)
+                logger.info(f"🔄 因activeKey变化释放管理器 {manager_to_release.manager_id}")
+                
+            except Exception as e:
+                logger.error(f"❌ 释放管理器失败: {e}")
+
+        try:
+            with app.app_context():
+                
+                # 尝试获取模型 - 可以设置更长的超时时间
+                manager = model_pool.acquire_model(timeout=30)  # 30秒超时
+                
+                if manager is None:
+                    return jsonify({'success': False, 'error': '模型池繁忙，请稍后重试'})
+                
+                # 从请求中获取conversation_id
+                conversation_id = data.get('conversationId')
+                if not conversation_id:
+                    return jsonify({'success': False, 'error': '缺少conversationId参数'})
+                
+                # 验证对话是否存在
+                conversation = get_conversation(conversation_id)
+                if not conversation:
+                    return jsonify({'success': False, 'error': f'对话 {conversation_id} 不存在'})
+                
+                # 定义token回调函数
+                def token_callback(token):
+                    try:
+                        socketio.emit('new_token', {'token': token}, room=client_id)
+                        logger.debug(f"发送token给客户端 {client_id}: {token}")
+                    except Exception as e:
+                        logger.error(f"发送token失败: {e}")
+                        # 如果发送失败，说明客户端可能已断开
+                        with client_lock:
+                            if client_id in client_managers:
+                                del client_managers[client_id]
+                        model_pool.release_model(manager)
+                
+                # 启动模型会话
+                manager.start_session(token_callback, new_active_key)
+                
+                # 保存映射关系
+                with client_lock:
+                    client_managers[client_id] = manager
+                
+                logger.info(f"✅ 客户端 {client_id} 成功分配到管理器 {manager.manager_id}")
+            
+                return jsonify({
+                    'success': True,
+                    'modelId': manager.manager_id,
+                    'conversationId': conversation_id
+                })
+                
+        except Exception as e:
+            logger.error(f"❌ 为客户端 {client_id} 分配模型失败: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+            
+        
+    except Exception as e:
+        logger.error(f"❌ 分配模型失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/release-model', methods=['POST'])
+def release_model():
+    """HTTP接口释放模型"""
+    try:
+        data = request.get_json()
+        sid = data.get('sid')
+        
+        if not sid:
+            return jsonify({'success': False, 'error': '缺少sid参数'}), 400
+        
+        # 查找并释放模型
+        with client_lock:
+            manager = client_managers.pop(sid, None)
+        
+        if manager:
+            try:
+                model_pool.release_model(manager)
+                logger.info(f"✅ 客户端 {sid} 的模型已释放")
+                return jsonify({'success': True})
+            except Exception as e:
+                logger.error(f"❌ 释放模型失败: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+        else:
+            return jsonify({'success': False, 'error': '未找到对应的模型'}), 404
+            
+    except Exception as e:
+        logger.error(f"❌ 释放模型失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     logger.info("🚀 启动VideoLLM后端服务...")
