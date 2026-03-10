@@ -57,7 +57,7 @@ class ModelManager:
     def _load_model(self):
         """加载模型实例"""
         try:
-            checkpoint = "/inspire/hdd/project/embodied-multimodality/public/pywang/jihuai/real_time_chat/models/0913_1_1_1_w_1_0"
+            checkpoint = "/inspire/hdd/project/video-understanding/public/personal/jihuai/real_time_chat/models/0913_1_1_1_w_1_0"
             self.processor = AutoProcessor.from_pretrained(
                 checkpoint,
                 trust_remote_code=True,
